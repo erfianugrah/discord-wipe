@@ -442,18 +442,31 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
     )
 
     counters = {"ok": 0, "gone": 0, "forbidden": 0, "skip_recent": 0, "skip_done": 0}
-    # Overall progress tracking. grand_total is the denominator for the
-    # "X/Y total" line printed every 10 deletes; t0 anchors the running
-    # throughput estimate. Pre-counting all targets means 194 small JSON
-    # reads upfront (~2s) but gives accurate ETAs from the first delete.
+    # Resume summary upfront: how much was already done, how much is
+    # still left, and how many channels are fully done so the resume
+    # is auditable from the logs alone. Pre-counts all targets (194
+    # small JSON reads, ~2s) which also feeds the running ETA.
     grand_total = 0
+    already_done_total = 0
+    fully_done_channels = 0
     for ch in channels:
         with contextlib.suppress(Exception):
-            grand_total += len(json.loads(ch.msgs_path.read_text()))
-    grand_done = len(cfg.state.deleted)
+            msgs = json.loads(ch.msgs_path.read_text())
+            grand_total += len(msgs)
+            ch_done = sum(1 for m in msgs if str(m["ID"]) in cfg.state.deleted)
+            already_done_total += ch_done
+            if ch_done == len(msgs):
+                fully_done_channels += 1
+    grand_done = already_done_total
+    remaining = grand_total - already_done_total
     t0 = time.monotonic()
     deletes_since_t0 = 0
-    print(f"[export] {grand_total} total message IDs in export; resuming from {grand_done}")
+    print(
+        f"[export] resume: {already_done_total}/{grand_total} "
+        f"({100.0 * already_done_total / grand_total:.1f}%) already done "
+        f"across {fully_done_channels}/{len(channels)} fully-done channels; "
+        f"{remaining} targets remaining"
+    )
 
     for ci, ch in enumerate(channels, 1):
         if STOP:
@@ -470,10 +483,12 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
 
         # Filter to old + not-already-deleted.
         targets: list[str] = []
+        ch_skip_done = 0
         for m in msgs:
             mid = str(m["ID"])
             if mid in cfg.state.deleted:
                 counters["skip_done"] += 1
+                ch_skip_done += 1
                 continue
             try:
                 ts = parse_export_ts(m["Timestamp"])
@@ -486,11 +501,19 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
                 continue
             targets.append(mid)
 
+        prefix = f"[export {ci}/{len(channels)}] {ch.type:10} {ch.name[:50]:50}"
         if not targets:
+            # Channel fully done. Print a one-liner so the resume is
+            # visible and the log doesn't look like the script jumped
+            # from channel 1 straight to channel 4.
+            if ch_skip_done > 0:
+                print(f"{prefix} {ch_skip_done}/{len(msgs)} already done — skip")
             continue
 
-        prefix = f"[export {ci}/{len(channels)}] {ch.type:10} {ch.name[:50]:50}"
-        print(f"{prefix} {len(targets)} to delete")
+        if ch_skip_done > 0:
+            print(f"{prefix} {len(targets)} to delete ({ch_skip_done}/{len(msgs)} already done)")
+        else:
+            print(f"{prefix} {len(targets)} to delete")
 
         for j, mid in enumerate(targets, 1):
             if STOP:
