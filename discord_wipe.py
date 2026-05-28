@@ -55,7 +55,7 @@ import requests
 # Constants
 # ---------------------------------------------------------------------------
 
-__version__ = "0.3.1"  # bump on every behaviour change; tag releases as vX.Y.Z
+__version__ = "0.3.3"  # bump on every behaviour change; tag releases as vX.Y.Z
 
 API = "https://discord.com/api/v10"
 DISCORD_EPOCH_MS = 1420070400000  # 2015-01-01T00:00:00Z
@@ -608,9 +608,14 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
                     # noteworthy ones (≥1s) and 5xx retries.
                     if hint >= 1.0:
                         print(f"  rate-limited; sleep {hint:.1f}s", file=sys.stderr)
-                    # 429's retry_after IS the bucket recovery hint —
-                    # hold it as the pacing floor for subsequent calls.
-                    extra_sleep = max(extra_sleep, hint)
+                    # 429's retry_after IS Discord's freshest bucket
+                    # signal — overwrite the floor with it, do NOT max.
+                    # max() ratcheted the floor monotonically upward:
+                    # a transient 2.3s retry early on trapped pacing
+                    # at 2.3s forever even when subsequent 429s reported
+                    # the bucket had relaxed to 1.0s. Observed cost in
+                    # 2026-05-28 v0.3.2 deploy: ~10/min throughput loss.
+                    extra_sleep = hint
                     time.sleep(hint)
                     if STOP:
                         break
@@ -773,7 +778,10 @@ def phase_live_catchup(s: requests.Session, cfg: WipeConfig) -> None:
                     status, hint = delete_message(s, cid, mid)
                     if status == "retry":
                         print(f"    rate-limited; sleep {hint:.1f}s")
-                        extra_sleep = max(extra_sleep, hint)
+                        # Overwrite, not max — see phase_export for the
+                        # v0.3.2→v0.3.3 rationale (max trapped the floor
+                        # at historical high-water mark).
+                        extra_sleep = hint
                         time.sleep(hint)
                         if STOP:
                             break

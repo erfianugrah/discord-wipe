@@ -563,6 +563,87 @@ class Bug9_PacingPersistsAcrossMessagesAndRefreshesFrom404And429(unittest.TestCa
                 f"found a 1.0s post-mark sleep — pacing floor wasn't propagated. sleeps={sleeps}",
             )
 
+    def test_subsequent_429_with_smaller_retry_after_refreshes_floor_down(self):
+        """When the first 429 reports 2.3s and a later 429 reports 1.0s,
+        the persistent floor must follow the FRESHEST value (1.0s),
+        not stay stuck at the historical worst (2.3s).
+
+        Pre-v0.3.3 used max(extra_sleep, hint) which ratcheted the
+        floor monotonically upward — a single transient 2.3s retry
+        early in a run trapped the pacer at 2.3s forever, even when
+        Discord's subsequent 429s signalled the bucket had relaxed.
+        Observed cost: ~10/min throughput loss on the 404-dominant
+        recovery phase (2026-05-28 v0.3.2 deploy logs).
+        """
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            state = dw.State(tmp / "state.json")
+            cfg = _make_cfg(state, delete_delay=1.0)
+            sess = mock.MagicMock()
+
+            sleeps: list[float] = []
+            # Cycle:
+            #   msg-1: 429 (2.3) → 404           floor should be 2.3 here
+            #   msg-2: 429 (1.0) → 404           floor must DROP to 1.0
+            #   msg-3: 404 (no 429)               post-sleep should be 1.0, not 2.3
+            delete_returns = [
+                ("retry", 2.3),
+                ("gone", 0.0),
+                ("retry", 1.0),
+                ("gone", 0.0),
+                ("gone", 0.0),
+            ]
+            search_pages = [
+                (
+                    3,
+                    [
+                        {"id": "msg-1", "channel_id": "c1", "hit": True},
+                        {"id": "msg-2", "channel_id": "c1", "hit": True},
+                        {"id": "msg-3", "channel_id": "c1", "hit": True},
+                    ],
+                    None,
+                ),
+                (0, [], None),
+                (0, [], None),
+            ]
+            with (
+                mock.patch.object(dw, "list_my_guilds", return_value=[]),
+                mock.patch.object(
+                    dw,
+                    "list_my_dms",
+                    return_value=[{"id": "c1", "type": 1, "recipients": []}],
+                ),
+                mock.patch.object(dw, "search_messages", side_effect=search_pages),
+                mock.patch.object(dw, "delete_message", side_effect=delete_returns),
+                mock.patch.object(dw.time, "sleep", side_effect=lambda s: sleeps.append(s)),
+            ):
+                dw.phase_live_catchup(sess, cfg)
+
+            # Expected ordered sleeps:
+            #   2.3   (msg-1 inner retry for 429)
+            #   2.3   (msg-1 post-mark, floor at 2.3)
+            #   1.0   (msg-2 inner retry for 429)
+            #   1.0   (msg-2 post-mark, floor REFRESHED DOWN to 1.0)
+            #   1.0   (msg-3 post-mark, floor stays at 1.0)
+            #   0.0   (search_delay between pages)
+            # The load-bearing assertion: msg-3 must NOT see a 2.3 sleep.
+            non_zero_post = [s for s in sleeps if s > 0]
+            self.assertGreaterEqual(
+                len(non_zero_post), 5, f"expected ≥5 non-zero sleeps, got {sleeps}"
+            )
+            # Find sleeps AFTER the first 1.0 retry — they must all be ≤ 1.0.
+            try:
+                first_small_retry = sleeps.index(1.0)
+            except ValueError:
+                self.fail(f"no 1.0s sleep present in {sleeps}")
+            tail = [s for s in sleeps[first_small_retry + 1 :] if s > 0]
+            self.assertTrue(
+                all(s <= 1.0 + 1e-6 for s in tail),
+                f"floor failed to refresh down after smaller 429; "
+                f"sleeps post-small-429 = {tail} (full = {sleeps})",
+            )
+
     def test_bucket_hint_helper_extracts_from_any_response(self):
         """_bucket_hint() must read rate-limit headers regardless of status."""
         for status in (204, 404, 429):

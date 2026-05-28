@@ -160,18 +160,39 @@ Sub-1s 429-retry logs are suppressed (the pacer handles them and
 there's nothing to act on). `>=1s` retries and 5xx errors are still
 logged so persistent throttling is visible.
 
-**Persistent floor across messages (v0.3.2+).** `extra_sleep` is
-hoisted to scope level (per-channel in export, per-scope in catchup)
-so pacing info learned from one message applies to the next. When a
-429 fires, its `retry_after` becomes the new `extra_sleep` floor;
-subsequent calls use `max(DELETE_DELAY, extra_sleep)` until a 204 or
-204-with-headers refreshes the estimate downward. Crucially, a 404
-with NO rate-limit headers (`hint=0.0`) does NOT erase the prior floor
-— we only refresh `extra_sleep` when the new response carries
-bucket info we can trust. This fixes the 404-heavy degenerate case
-(re-running a wipe whose state was lost) where the script would
-otherwise cycle 429→retry→404→floor→429 forever at ~18/min instead
-of the bucket's natural ~30/min.
+**Floor is overwritten on 429, persists on header-less 404 (v0.3.3+).**
+`extra_sleep` is hoisted to scope level (per-channel in export,
+per-scope in catchup) so pacing info learned from one message
+applies to the next. The rules:
+
+- **On 429**: `extra_sleep = hint` (the retry_after). Plain overwrite.
+  Discord's most recent 429 is by definition the freshest signal
+  about current bucket state. v0.3.2 used `max()` here — a ratchet
+  that trapped the floor at the historical worst. A single 2.3s
+  retry early in a run held pacing at 2.3s forever even when
+  subsequent 429s reported the bucket had relaxed to 1.0s. Cost:
+  ~10/min throughput loss observed in the 2026-05-28 v0.3.2 deploy.
+- **On 204 with valid headers**: `extra_sleep = hint` (the
+  `Reset-After / Remaining` estimate). Same overwrite.
+- **On 404 with valid headers**: same.
+- **On 204/404 with `hint == 0.0`** (no rate-limit headers in the
+  response): do NOT touch `extra_sleep`. The `hint > 0` guard means
+  a header-less 404 cannot erase a freshly-set 429 floor. Without
+  this guard, the 404-dominant degenerate case (re-running a wipe
+  whose state was lost) would cycle 429→retry→404→floor=0→429
+  forever at ~18/min.
+
+Resulting per-call sleep is `max(DELETE_DELAY, extra_sleep)` — the
+static floor for account-level abuse protection plus the dynamic
+bucket-derived pace.
+
+Reality check: Discord's bucket is the absolute ceiling. On the
+operator's account it currently sits around 1.0-1.7s/call depending
+on load. The achievable rate is bounded by Discord's choice, not
+ours; our job is to converge cleanly to whatever bucket pace Discord
+is currently advertising. Theoretical ceiling at 1.0s/retry would be
+~50/min, but the double-pay design (sleep retry_after + sleep
+post-mark) soft-caps the 404-dominant phase at ~25-30/min.
 
 ### Search endpoint
 
