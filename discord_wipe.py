@@ -307,46 +307,60 @@ def search_messages(
     return body.get("total_results", 0), msgs, None
 
 
+def _bucket_hint(r: requests.Response) -> float:
+    """Optimal per-call sleep from Discord's per-bucket rate-limit headers.
+
+    Discord publishes the same headers on EVERY response that hit a
+    rate-limited route (204, 404, 429 all carry them when applicable):
+      X-RateLimit-Limit         max requests in this bucket window
+      X-RateLimit-Remaining     requests left in current window
+      X-RateLimit-Reset-After   seconds until the bucket refills
+      X-RateLimit-Bucket        opaque bucket id
+
+    Optimal pacing = Reset-After / Remaining — spreads the quota evenly
+    so we never tip into a 429. If Remaining is 0 we wait the full
+    window. The caller takes max(DELETE_DELAY, hint) so DELETE_DELAY
+    remains a safety floor against account-level abuse detection
+    (which is independent of per-route buckets).
+
+    Returns 0.0 if no headers present — caller falls back to its floor.
+    """
+    rem_s = r.headers.get("X-RateLimit-Remaining", "")
+    reset = float(r.headers.get("X-RateLimit-Reset-After", "0") or 0)
+    try:
+        rem = int(rem_s) if rem_s != "" else -1
+    except ValueError:
+        rem = -1
+    if rem == 0 and reset > 0:
+        return reset
+    if rem > 0 and reset > 0:
+        return reset / rem
+    return 0.0
+
+
 def delete_message(s: requests.Session, channel_id: str, msg_id: str) -> tuple[str, float]:
     """Delete one message.
 
     Returns (status, sleep_hint_seconds):
-      'ok'        — deleted (204).
-      'gone'      — already deleted (404). Treat as success.
+      'ok'        — deleted (204). hint = bucket-derived optimal pace.
+      'gone'      — already deleted (404). hint = bucket-derived pace too —
+                    Discord bills 404 against the same bucket, so a
+                    stream of 404s (e.g. re-running a wipe whose state
+                    was lost) gets the same pacing signal as 204s.
       'forbidden' — system message / not yours / channel revoked (403).
-      'retry'     — caller should sleep `sleep_hint` and try again.
+      'retry'     — caller should sleep `sleep_hint` and try again,
+                    AND treat sleep_hint as a persistent pacing floor
+                    until a 204/404 refreshes the bucket estimate.
     """
     url = f"{API}/channels/{channel_id}/messages/{msg_id}"
     r = s.delete(url, timeout=30)
     _check_auth(r)
 
     if r.status_code == 204:
-        # Precise pacing via Discord's per-bucket rate-limit headers.
-        # Discord publishes:
-        #   X-RateLimit-Limit         max requests in this bucket window
-        #   X-RateLimit-Remaining     requests left in current window
-        #   X-RateLimit-Reset-After   seconds until the bucket refills
-        #   X-RateLimit-Bucket        opaque bucket id
-        #
-        # Optimal pacing = Reset-After / Remaining — spreads the quota
-        # evenly so we never tip into a 429. If Remaining is 0 we wait
-        # the full window. The caller takes max(DELETE_DELAY, hint) so
-        # DELETE_DELAY remains a safety floor against account-level
-        # abuse detection (which is independent of per-route buckets).
-        rem_s = r.headers.get("X-RateLimit-Remaining", "")
-        reset = float(r.headers.get("X-RateLimit-Reset-After", "0") or 0)
-        try:
-            rem = int(rem_s) if rem_s != "" else -1
-        except ValueError:
-            rem = -1
-        if rem == 0 and reset > 0:
-            return "ok", reset  # bucket empty: wait full window
-        if rem > 0 and reset > 0:
-            return "ok", reset / rem  # spread the remaining quota
-        return "ok", 0.0
+        return "ok", _bucket_hint(r)
 
     if r.status_code == 404:
-        return "gone", 0.0
+        return "gone", _bucket_hint(r)
 
     if r.status_code == 400:
         # Discord uses HTTP 400 with a semantic `code` field for terminal
@@ -565,6 +579,13 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
         else:
             print(f"{prefix} {len(targets)} to delete")
 
+        # extra_sleep persists across messages so a 429's retry_after
+        # becomes a sustained pacing floor until a 204/404 with fresh
+        # bucket headers refreshes the estimate. Pre-v0.3.2 reset it
+        # to 0.0 per message, which caused a 404-heavy stream (e.g.
+        # re-running a wipe whose state was lost) to cycle
+        # 429→retry→404→floor→429 forever at ~18/min.
+        extra_sleep = 0.0
         for j, mid in enumerate(targets, 1):
             if STOP:
                 break
@@ -578,7 +599,6 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
                 deletes_since_t0 += 1
                 continue
 
-            extra_sleep = 0.0
             status = "retry"
             while True:
                 status, hint = delete_message(s, ch.id, mid)
@@ -588,11 +608,21 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
                     # noteworthy ones (≥1s) and 5xx retries.
                     if hint >= 1.0:
                         print(f"  rate-limited; sleep {hint:.1f}s", file=sys.stderr)
+                    # 429's retry_after IS the bucket recovery hint —
+                    # hold it as the pacing floor for subsequent calls.
+                    extra_sleep = max(extra_sleep, hint)
                     time.sleep(hint)
                     if STOP:
                         break
                     continue
-                if status == "ok":
+                if status in ("ok", "gone") and hint > 0:
+                    # Header-derived pacing refreshes the floor when we
+                    # have valid bucket info — may be smaller than the
+                    # stale 429-derived floor if the bucket has refilled.
+                    # When hint == 0 (no rate-limit headers on this
+                    # response — Discord doesn't always include them on
+                    # 404), KEEP the prior floor so a 429-derived floor
+                    # is not erased by a header-less 404.
                     extra_sleep = hint
                 break
 
@@ -680,6 +710,11 @@ def phase_live_catchup(s: requests.Session, cfg: WipeConfig) -> None:
             break
         print(f"[catchup {ti}/{len(targets)}] {label}")
 
+        # extra_sleep is hoisted to scope-level so the pacing floor
+        # survives across pages within a scope. See phase_export for
+        # the full rationale. Reset per-scope because Discord may
+        # bucket scopes independently.
+        extra_sleep = 0.0
         # Loop: search → delete → wait for index → repeat. Empty page ends scope.
         empty_streak = 0
         while not STOP:
@@ -733,17 +768,19 @@ def phase_live_catchup(s: requests.Session, cfg: WipeConfig) -> None:
                     cfg.state.mark(mid)
                     continue
 
-                extra_sleep = 0.0
                 status = "retry"
                 while True:
                     status, hint = delete_message(s, cid, mid)
                     if status == "retry":
                         print(f"    rate-limited; sleep {hint:.1f}s")
+                        extra_sleep = max(extra_sleep, hint)
                         time.sleep(hint)
                         if STOP:
                             break
                         continue
-                    if status == "ok":
+                    if status in ("ok", "gone") and hint > 0:
+                        # See phase_export for why hint > 0 matters —
+                        # a header-less 404 must NOT erase a 429 floor.
                         extra_sleep = hint
                     break
 

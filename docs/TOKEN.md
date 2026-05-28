@@ -46,19 +46,29 @@ Three points of inspection (in `discord_wipe.py`):
 
 1. **Startup** — `cmd_run` calls `get_me()` before doing anything
    else. If the token's dead at boot, we park immediately and never
-   touch any other endpoint.
+   touch any other endpoint. Also caches the `(user_id, username)`
+   pair for the identity check below.
 2. **Top of every pass** — same `get_me()` call. Catches mid-life
    rotation. Cost is one HTTP call per `INTERVAL_HOURS` (default
-   one per 24h) — negligible.
+   one per 24h) — negligible. Also detects **identity change**: if
+   the returned `id` differs from the cached one (token was swapped
+   to a *different account's* credential), the daemon parks itself
+   with a banner naming both identities. Without this guard the
+   script would silently search for the original user's messages
+   under the new user's permissions — mostly invisible 403s.
 3. **Every API call** — `_check_auth(response)` is called on the
    response of every wrapper (`get_me`, `list_my_guilds`,
    `list_my_dms`, `search_messages`, `delete_message`). If any of
    those returns 401, an `AuthError` is raised and bubbles up.
 
-Anywhere `AuthError` lands, `_auth_paused_exit` runs and the daemon
-parks.
+Anywhere `AuthError` lands — OR the identity check fires —
+`_auth_paused_exit` runs and the daemon parks.
 
 ## What "parked" looks like
+
+Two banner variants share the same paused-exit path:
+
+**Variant A — 401 token rejected:**
 
 - Container stays in `running` state. `docker ps` shows `Up`.
 - `docker logs discord-wipe --tail 30` shows the FATAL banner:
@@ -76,7 +86,7 @@ parks.
 
   To rotate:
     1. Grab the new Authorization header from DevTools.
-    2. Edit /mnt/user/appdata/discord-wipe/.env on servarr.
+    2. Edit /mnt/user/composer/stacks/discord-wipe/.env on servarr.
     3. `docker compose up -d` (recreates the container with the
        new env, sending us a graceful SIGTERM).
 
@@ -85,6 +95,15 @@ parks.
   a clear cause.
   ========================================================================
   ```
+
+**Variant B — identity change (token swapped to different account):**
+
+Same banner shape; the `reason:` line reads
+`identity changed mid-loop: was @oldname (id=...), now @newname (id=...)`.
+Resolution: edit `.env` back to the right account's token and recreate.
+
+**Both variants:**
+
 - CPU is ~0%. The script is in a `time.sleep(5)` loop waiting for the
   STOP signal.
 - **No further Discord API calls are made.** Critical for not getting
@@ -102,13 +121,13 @@ parks.
    token — no `Bot ` prefix, no `Bearer ` prefix.
 6. **Update `.env` on servarr:**
    ```sh
-   ssh servarr 'umask 077 && cat > /mnt/user/appdata/discord-wipe/.env' <<EOF
+   ssh servarr 'umask 077 && cat > /mnt/user/composer/stacks/discord-wipe/.env' <<EOF
    DISCORD_TOKEN=<new-token-here>
    EOF
    ```
 7. **Recreate the container** to pick up the new env:
    ```sh
-   ssh servarr 'cd /mnt/user/appdata/discord-wipe && docker compose up -d'
+   ssh servarr 'cd /mnt/user/composer/stacks/discord-wipe && docker compose up -d'
    ```
    This sends SIGTERM to the parked daemon, which exits cleanly. Compose
    then starts a fresh container with the new `DISCORD_TOKEN`.
@@ -121,7 +140,7 @@ parks.
 
 ## Token hygiene
 
-- `.env` lives **only** at `/mnt/user/appdata/discord-wipe/.env` on
+- `.env` lives **only** at `/mnt/user/composer/stacks/discord-wipe/.env` on
   servarr, chmod 600, owner `nobody:users`.
 - The token is **never** committed to git. The `.gitignore` enforces
   this; `.env.example` only contains the placeholder `replace-me`.
@@ -131,7 +150,7 @@ parks.
   the running container does.
 - Long-term, consider storing it in Vaultwarden and pulling it onto
   servarr at deploy time via the user's `vw_save` / env-rehydrate
-  helpers. Currently the canonical copy is `/mnt/user/appdata/discord-wipe/.env`.
+  helpers. Currently the canonical copy is `/mnt/user/composer/stacks/discord-wipe/.env`.
 
 ## What about getting a fresh token automatically?
 

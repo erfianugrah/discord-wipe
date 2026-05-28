@@ -6,13 +6,22 @@ Everything you do day-to-day with discord-wipe on `servarr`.
 
 - **Via Composer** (GitOps, primary): registered as the `discord-wipe`
   stack; push to `main` → GitHub Actions builds + pushes
-  `ghcr.io/erfianugrah/discord-wipe:main` → Composer pulls →
-  `docker compose up -d` redeploys. See "Composer wiring" below.
-  Daily reality:
+  `ghcr.io/erfianugrah/discord-wipe:main` → Composer is meant to pull
+  via its webhook listener and `docker compose up -d` redeploy. See
+  "Composer wiring" below. **In practice the auto-pull has been flaky
+  for this stack** (verified 2026-05-28 against v0.3.0 + v0.3.1): the
+  image landed on ghcr but composer didn't redeploy either time. After
+  `git push`, always verify the running image matches the latest commit:
   ```sh
-  git push origin main                  # composer auto-syncs from here
+  ssh servarr 'docker inspect discord-wipe --format "{{.Created}} {{.Image}}"'
   ```
-  Or, to force a redeploy without changing code:
+  If `{{.Created}}` is older than your push timestamp, force a pull
+  via the composer container (the docker compose binary lives there,
+  not on the Unraid host):
+  ```sh
+  ssh servarr 'docker exec composer sh -c "cd /opt/stacks/discord-wipe && docker compose pull && docker compose up -d"'
+  ```
+  Or via the composer API (also bypasses webhook):
   ```sh
   curl -sf -X POST -H "X-API-Key: $COMPOSER_API_KEY" \
       "https://composer.erfi.io/api/v1/stacks/discord-wipe/up?async=true"
@@ -135,6 +144,20 @@ The daemon detects this at the `get_me` pre-flight and parks itself
 instructions. The container stays alive (no restart-loop hammering)
 until you `docker compose up -d` with a new `.env`.
 
+### Identity-change — token swapped to a different account
+
+Same paused-exit shape as 401, different banner. Triggers when the
+per-pass pre-flight `GET /users/@me` returns a user ID that doesn't
+match the one we cached at startup (e.g. `.env` was edited to a
+different account's token mid-loop). Without this guard the script
+would search for the original user's messages under the new user's
+permissions — mostly silent 403s. Banner reads:
+```
+identity changed mid-loop: was @oldname (id=...), now @newname (id=...)
+```
+Resolution: edit `.env` back to the right account's token and
+`docker compose up -d` (same SIGTERM handshake as the 401 case).
+
 ### 429 — rate-limited
 
 Handled. The script reads `retry_after` from the body (or
@@ -176,7 +199,7 @@ is one-time, then every push to `main` auto-redeploys:
    `https://composer.erfi.io/api/v1/hooks/<id>` → composer pulls the
    new compose.yaml from git and runs `docker compose pull && up -d`.
 4. The `.env` lives outside git on the host
-   (`/mnt/user/appdata/discord-wipe/.env`, chmod 600) and survives
+   (`/mnt/user/composer/stacks/discord-wipe/.env`, chmod 600) and survives
    redeploys.
 
 To set this up the first time, see the composer skill or
@@ -198,13 +221,46 @@ ssh servarr 'jq "{
   last_pass_at,
   total_passes,
   sample_ids: (.deleted | .[0:3])
-}" /mnt/user/appdata/discord-wipe/state/state.json'
+}" /mnt/user/discord-wipe/state/state.json'
 ```
 
 If `deleted` is growing every pass and `last_pass_at` is recent (<2 ×
 `INTERVAL_HOURS` ago), everything's working. If `deleted` is stuck and
-`last_pass_at` is old, the daemon is either parked on 401 or stopped.
-`docker logs` will say which.
+`last_pass_at` is old, the daemon is either parked on 401, parked on
+identity-change, or stopped. `docker logs` will say which.
+
+### Corrupt state.json recovery
+
+If the script can't parse `state.json` on load (rare, but happens if
+the filesystem flushed mid-write or someone hand-edited and broke the
+JSON), it:
+
+1. Renames the bad file to `state.json.corrupt-YYYYMMDDTHHMMSSZ`.
+2. Prints a WARN line: `[state] WARN: ... is corrupt (...); moved to ...; starting fresh`.
+3. Resumes with empty state — every "forgotten" ID gets re-issued,
+   hits Discord 404, is counted as `gone` and re-marked. Safe but
+   slow (~6h extra wall time on a 100K-message backlog).
+
+List backups:
+```sh
+ssh servarr 'ls -la /mnt/user/discord-wipe/state/state.json.corrupt-*'
+```
+
+Forensic inspection of a backup (raw bytes, may not be valid JSON):
+```sh
+ssh servarr 'hexdump -C /mnt/user/discord-wipe/state/state.json.corrupt-* | head -20'
+```
+
+If the backup is *mostly* valid JSON (e.g. truncated mid-array),
+recover the deleted IDs manually before restart:
+```sh
+ssh servarr 'cat /mnt/user/discord-wipe/state/state.json.corrupt-XXX' \
+    | sed -E 's/,?$//' \
+    | jq -R 'fromjson? // empty' \
+    | jq -s '{deleted: (.[0].deleted // []), export_consumed: (.[0].export_consumed // false)}' \
+    > /tmp/recovered.json
+# Inspect, then push back: scp /tmp/recovered.json servarr:/mnt/user/discord-wipe/state/state.json
+```
 
 For live monitoring during the long initial backfill, the composer
 dashboard at `composer.erfi.io` has a streaming logs view that
@@ -249,6 +305,14 @@ Loss of the state file ≠ disaster. The script will:
 Just slower (every ID gets a redundant HTTP call). Plan for ~6 extra
 hours on the next pass and you're fine. The header-driven pacer
 still applies, so account-level abuse heuristics stay un-triggered.
+
+This is also why **v0.3.0's State.gc() was so bad**: it silently
+produced exactly this "lost state" condition (dropping all old-snowflake
+IDs from state on every pass), and the slow-recovery property masked
+the fact that the GC was wrong. ~8h of API quota was burned on a live
+wipe before the operator noticed the resume counter had reset to 0%.
+v0.3.1 reverts the GC and a regression test guards against
+reintroduction — see `docs/DESIGN.md` §"What state.deleted is NOT".
 
 ## Removing the stack
 

@@ -481,5 +481,114 @@ class Bug8_PreflightRefreshesIdentity(unittest.TestCase):
             self.assertGreaterEqual(call_count["n"], 2)
 
 
+# ---------------------------------------------------------------------------
+# Bug 9: pacing must persist across messages and refresh from 404 + 429.
+#
+# When a stream of DELETEs lands on already-deleted IDs (404), the catchup
+# loop must NOT settle at "every call 429s". Pre-v0.3.2 behaviour:
+#   - delete_message read X-RateLimit-* headers ONLY on 204.
+#   - extra_sleep was re-initialised to 0.0 on every for-loop iteration.
+#   - So a 404 path → extra_sleep stays 0.0 → post-sleep = floor (1.0s)
+#     → next call hits 429 → retry 2.3s → 404 → repeat.
+# Symptoms in prod: rate dropped from ~30/min on 204s to ~18/min on 404s.
+#
+# Fix: read headers on 204 + 404 + 429, hoist extra_sleep out of the
+# for-loop, treat a 429's retry_after as the new persistent pacing floor.
+# ---------------------------------------------------------------------------
+
+
+class Bug9_PacingPersistsAcrossMessagesAndRefreshesFrom404And429(unittest.TestCase):
+    def test_429_then_204_propagates_pacing_to_next_message(self):
+        """After a 429 (retry_after=2.3s) the NEXT message's post-mark sleep
+        must be at least 2.3s, not the 1.0s floor."""
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            state = dw.State(tmp / "state.json")
+            cfg = _make_cfg(state, delete_delay=1.0)
+            sess = mock.MagicMock()
+
+            sleeps: list[float] = []
+            # delete_message returns a sequence:
+            #   msg-1 attempt 1: 429 (retry_after=2.3s)
+            #   msg-1 attempt 2: 404 (gone)
+            #   msg-2 attempt 1: 404 (gone)
+            #   msg-3+: doesn't matter (search ends)
+            delete_returns = [
+                ("retry", 2.3),
+                ("gone", 0.0),
+                ("gone", 0.0),
+                ("gone", 0.0),
+            ]
+            search_pages = [
+                (
+                    2,
+                    [
+                        {"id": "msg-1", "channel_id": "c1", "hit": True},
+                        {"id": "msg-2", "channel_id": "c1", "hit": True},
+                    ],
+                    None,
+                ),
+                (0, [], None),
+                (0, [], None),
+            ]
+            with (
+                mock.patch.object(dw, "list_my_guilds", return_value=[]),
+                mock.patch.object(
+                    dw,
+                    "list_my_dms",
+                    return_value=[{"id": "c1", "type": 1, "recipients": []}],
+                ),
+                mock.patch.object(dw, "search_messages", side_effect=search_pages),
+                mock.patch.object(dw, "delete_message", side_effect=delete_returns),
+                mock.patch.object(dw.time, "sleep", side_effect=lambda s: sleeps.append(s)),
+            ):
+                dw.phase_live_catchup(sess, cfg)
+
+            # We expect:
+            #   - One 2.3s sleep from the inner 429 retry.
+            #   - msg-1 post-mark sleep ≥ 2.3s (pacing floor inherited from 429).
+            #   - msg-2 post-mark sleep ≥ 2.3s (pacing floor persists across messages).
+            sleeps_geq_floor = [s for s in sleeps if s >= 2.3]
+            self.assertGreaterEqual(
+                len(sleeps_geq_floor),
+                3,
+                f"expected ≥3 sleeps >= 2.3s (1 retry + 2 post-mark with persistent "
+                f"floor); got sleeps={sleeps}",
+            )
+            # AND msg-2's post-mark sleep specifically must NOT be the 1.0 floor.
+            non_retry_sleeps = [s for s in sleeps if s != 2.3]
+            self.assertFalse(
+                any(0.99 <= s <= 1.01 for s in non_retry_sleeps),
+                f"found a 1.0s post-mark sleep — pacing floor wasn't propagated. sleeps={sleeps}",
+            )
+
+    def test_bucket_hint_helper_extracts_from_any_response(self):
+        """_bucket_hint() must read rate-limit headers regardless of status."""
+        for status in (204, 404, 429):
+            r = mock.MagicMock()
+            r.status_code = status
+            r.headers = {"X-RateLimit-Remaining": "4", "X-RateLimit-Reset-After": "8.0"}
+            self.assertEqual(
+                dw._bucket_hint(r),
+                2.0,
+                f"_bucket_hint failed on {status}: expected 8/4 = 2.0",
+            )
+        # No headers → 0.0 (fall back to floor).
+        r = mock.MagicMock()
+        r.headers = {}
+        self.assertEqual(dw._bucket_hint(r), 0.0)
+
+    def test_delete_message_returns_hint_on_404_when_headers_present(self):
+        sess = mock.MagicMock()
+        resp = mock.MagicMock()
+        resp.status_code = 404
+        resp.headers = {"X-RateLimit-Remaining": "5", "X-RateLimit-Reset-After": "10.0"}
+        sess.delete.return_value = resp
+        status, hint = dw.delete_message(sess, "c1", "m1")
+        self.assertEqual(status, "gone")
+        self.assertEqual(hint, 2.0)  # 10/5
+
+
 if __name__ == "__main__":
     unittest.main()

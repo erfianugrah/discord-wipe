@@ -10,8 +10,10 @@ forever as a Docker container; every pass deletes everything you posted
 older than `RETENTION_DAYS` (default 7). One file of Python (stdlib +
 `requests`), one Dockerfile, one Compose stack.
 
-Lives at `/mnt/user/appdata/discord-wipe/` on `servarr` in production.
-Image is published to `ghcr.io/erfianugrah/discord-wipe`.
+Stack files live at `/mnt/user/composer/stacks/discord-wipe/` on `servarr`
+(composer-managed git clone); data (export RO, state RW) lives at
+`/mnt/user/discord-wipe/`. Image is published to `ghcr.io/erfianugrah/discord-wipe`.
+Current version: see `__version__` in `discord_wipe.py` (0.3.1 as of this commit).
 
 ## Hard safety rules (read these or break things)
 
@@ -42,6 +44,20 @@ Image is published to `ghcr.io/erfianugrah/discord-wipe`.
 - **No refresh flow.** Discord user tokens are static; on 401 the
   daemon parks itself (`_auth_paused_exit`) and waits for a manual
   rotation via `.env` + `docker compose up -d`. See `docs/TOKEN.md`.
+- **`state.deleted` is NOT garbage-collectable by snowflake age.** This
+  was the v0.3.0 footgun (commit `fc1b289`, reverted by `5cbbcb3`).
+  The set holds IDs of messages we **just deleted** — and we only
+  deleted them because they were OLDER than the retention cutoff.
+  Their snowflake timestamps are therefore OLD by definition. Any GC
+  of the form "drop IDs older than X" will sweep out the just-deleted
+  set; the next pass re-attempts 100% of them against Discord. v0.3.0
+  shipped exactly that and burned ~8h of a live wipe's API quota
+  before the operator noticed. A `test_state_has_no_snowflake_based_gc_method`
+  regression test in `tests/test_discord_wipe.py` fires if anyone
+  reintroduces `State.gc()`. The correct shape if growth ever becomes
+  a real problem is to track MARK-TIME per ID (when *we* learned about
+  the deletion), not the message's own snowflake — that needs a state
+  schema change. Until then: do not GC.
 
 ## Architecture in one paragraph
 
@@ -67,18 +83,25 @@ whatever Discord's bucket is currently advertising.
 discord-wipe/
 ├── AGENTS.md              this file
 ├── README.md              user-facing overview + quick deploy
-├── discord_wipe.py        the single-file script (stdlib + requests)
+├── discord_wipe.py        the single-file script (stdlib + requests, ~990 lines)
 ├── Dockerfile             python:3.12-slim, non-root, PUID=99/PGID=100
 ├── compose.yaml           the Compose stack (ghcr image; build is fallback)
 ├── .env.example           token template; never commit a real .env
 ├── .gitignore             blocks .env, state/, export/
 ├── .dockerignore          keeps build context lean
+├── pyproject.toml         ruff config + project metadata
+├── tests/
+│   ├── __init__.py
+│   └── test_discord_wipe.py  stdlib unittest, 13 tests: 3 safety mandate
+│                             (only-my-messages defence-in-depth) + 8 regression
+│                             (one per fixed bug) + 2 anti-GC guards (the v0.3.0
+│                             footgun stays buried)
 ├── docs/
 │   ├── DESIGN.md          design rationale + alternatives considered
-│   ├── OPERATIONS.md      runbook (deploy, rotate, debug, backfill)
+│   ├── OPERATIONS.md      runbook (deploy, rotate, debug, backfill, recovery)
 │   └── TOKEN.md           token lifecycle, 401 behaviour, rotation
 └── .github/workflows/
-    ├── ci.yml             lint + py_compile on push/PR
+    ├── ci.yml             ruff + py_compile + unit tests + docker build smoke
     └── release.yml        multi-arch ghcr.io image on main + tags
 ```
 
@@ -133,24 +156,56 @@ Dry-runs DO hit the live API for read operations (`/users/@me`,
 pagination behaviour against production.
 
 Three dry-run-specific correctness bugs landed in the first commits
-and are now defended against, so if you touch the dry-run paths,
-grep for these comments and don't regress:
+and are now defended against. Grep `discord_wipe.py` for these
+behaviours and don't regress (line numbers drift; behaviours don't):
 
-- Search-no-progress guard in catchup (line ~634). In dry-run the
-  same search page keeps returning because nothing is deleted; the
-  guard breaks out when every hit on a page is already in
-  `state.deleted`. Same code defends real runs against a stale
-  search index re-serving deleted IDs.
-- `state.export_consumed` is NOT flipped on dry-run (line ~498) —
-  otherwise a follow-up real run would skip the export entirely.
-- Dry-run still calls `state.mark(mid)` (line ~474) so catchup
-  doesn't double-count export IDs.
+- **Search-no-progress guard** in catchup. In dry-run the same search
+  page keeps returning because nothing is deleted; the guard breaks
+  out when every hit on a page is already in `state.deleted`. Same
+  code defends real runs against a stale search index re-serving
+  deleted IDs. Grep `new_in_page`.
+- **`state.export_consumed` is NOT flipped on dry-run** — otherwise a
+  follow-up real run would skip the export entirely. Grep
+  `if not STOP and not cfg.dry_run:`.
+- **Dry-run still calls `state.mark(mid)`** so catchup doesn't
+  double-count export IDs. Grep `if cfg.dry_run:` in `phase_export`.
+
+## Tests
+
+13 stdlib `unittest` tests under `tests/`. Run with:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+Categories:
+
+- **Safety mandate** (3 tests, AGENTS.md "only-my-messages" rule): export
+  reads only `c<id>/messages.json` per channel; catchup `search_messages`
+  always passes `author_id=self`; `delete_message` returns `forbidden`
+  on 403 without retry. Re-run these before merging any change that
+  touches the delete pipeline.
+- **Regression** (8 tests, one per v0.3.0/v0.3.1 fix): SIGTERM-during-
+  retry must not mark (export + catchup), ZeroDivisionError on empty
+  export, catchup pacing uses `max()` not sum, corrupt state.json is
+  backed up before reset, corrupt `messages.json` doesn't crash the
+  pass, `messages.json` parsed once per channel per pass, pre-flight
+  bails on identity change.
+- **Anti-GC guard** (2 tests, the v0.3.0 lesson): IDs with old
+  snowflake timestamps survive a save/load round-trip, AND
+  `hasattr(dw.State, "gc")` must remain False. The second test
+  catches anyone reintroducing the footgun.
+
+Mocks live at the helper-function boundary (`delete_message`,
+`search_messages`, `get_me`, `list_my_guilds`, `list_my_dms`) so
+tests exercise the real `phase_export` / `phase_live_catchup` control
+flow without touching Discord.
 
 ## Commands (production on servarr)
 
 Once published to `ghcr.io/erfianugrah/discord-wipe`, the deploy is
 just `docker compose pull && docker compose up -d`. Token lives in
-`/mnt/user/appdata/discord-wipe/.env`. Full runbook in
+`/mnt/user/composer/stacks/discord-wipe/.env`. Full runbook in
 `docs/OPERATIONS.md`.
 
 ## Image pipeline
@@ -160,22 +215,38 @@ just `docker compose pull && docker compose up -d`. Token lives in
   `:sha-<short>`.
 - `v*` tag push → same workflow also tags `:v1.2.3`, `:1.2`, `:1`, and
   `:latest`.
-- Composer subscribes to the `:main` tag via its webhook listener and
-  pulls + redeploys on push. See `docs/OPERATIONS.md` for the wiring.
+- Composer is meant to subscribe to the `:main` tag via its webhook
+  listener and pull + redeploy on push. **In practice this has been
+  flaky** for this stack (verified 2026-05-28 against v0.3.0 + v0.3.1):
+  the new tag landed on ghcr but composer didn't auto-pull either time.
+  Manual redeploy workaround:
+  ```sh
+  ssh servarr 'docker exec composer sh -c "cd /opt/stacks/discord-wipe && docker compose pull && docker compose up -d"'
+  ```
+  Note the in-container stack path is `/opt/stacks/discord-wipe/`,
+  NOT the host's `/mnt/user/composer/stacks/discord-wipe/` — composer
+  runs `docker compose` from inside its own container.
 
 Verify a build via `gh run list --workflow=release.yml` or
-`oci_tags ghcr.io/erfianugrah/discord-wipe`. The image must build
-before composer can `docker compose pull` it — if the deploy job
-finishes "successfully" but the running image SHA hasn't changed,
-the build either hasn't landed yet or the `:main` tag is being
-overwritten by an in-flight workflow.
+`oci_tags ghcr.io/erfianugrah/discord-wipe`. Verify the running image
+is the latest commit:
+
+```sh
+ssh servarr 'docker inspect discord-wipe --format "{{.Created}} {{.Image}}"'
+# Compare {{.Created}} to the time of your push.
+```
 
 ## CI hygiene rules
 
-- Every PR must pass `.github/workflows/ci.yml` (py_compile + ruff +
+- Every PR must pass `.github/workflows/ci.yml` (ruff check + ruff
+  format --check + py_compile + `unittest discover -s tests` +
   docker build smoke).
 - Bump `__version__` in `discord_wipe.py` for any behaviour change.
-  Tag releases as `v<major>.<minor>.<patch>` from `main` only.
+  Tag releases as `v<major>.<minor>.<patch>` from `main` only. Also
+  bump `pyproject.toml`'s `version =` to match.
+- When adding a regression test for a fixed bug, name the test class
+  `BugN_<concise-description>` and reference the commit SHA in the
+  docstring so future `grep Bug` surfaces the trail.
 - Never commit a file that contains a Discord token, even a fake one
   that looks real (Discord's secret-scanner will revoke it).
 - The `.env.example` template uses `replace-me` as the placeholder.
@@ -198,10 +269,12 @@ overwritten by an in-flight workflow.
 ## Tool-routing for discord-wipe questions
 
 1. Source-of-truth code → `read /home/erfi/discord-wipe/discord_wipe.py`.
-   It's ~750 lines and self-contained.
-2. Token / 401 / rotation behaviour → `docs/TOKEN.md`.
-3. Deploy / debug → `docs/OPERATIONS.md`.
-4. "Why this design?" → `docs/DESIGN.md`.
-5. Discord API surface → `docs.erfi.io` has no `discord` source, so
+   ~990 lines, self-contained.
+2. Test patterns + safety-mandate coverage →
+   `read /home/erfi/discord-wipe/tests/test_discord_wipe.py`.
+3. Token / 401 / identity-change / rotation behaviour → `docs/TOKEN.md`.
+4. Deploy / debug / state-corruption recovery → `docs/OPERATIONS.md`.
+5. "Why this design?" + state-machine semantics → `docs/DESIGN.md`.
+6. Discord API surface → `docs.erfi.io` has no `discord` source, so
    fall back to `web_research` against `discord.com/developers/docs/...`.
-6. Image versions → `oci_tags ghcr.io/erfianugrah/discord-wipe`.
+7. Image versions → `oci_tags ghcr.io/erfianugrah/discord-wipe`.

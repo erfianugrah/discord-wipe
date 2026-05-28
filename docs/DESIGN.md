@@ -160,6 +160,19 @@ Sub-1s 429-retry logs are suppressed (the pacer handles them and
 there's nothing to act on). `>=1s` retries and 5xx errors are still
 logged so persistent throttling is visible.
 
+**Persistent floor across messages (v0.3.2+).** `extra_sleep` is
+hoisted to scope level (per-channel in export, per-scope in catchup)
+so pacing info learned from one message applies to the next. When a
+429 fires, its `retry_after` becomes the new `extra_sleep` floor;
+subsequent calls use `max(DELETE_DELAY, extra_sleep)` until a 204 or
+204-with-headers refreshes the estimate downward. Crucially, a 404
+with NO rate-limit headers (`hint=0.0`) does NOT erase the prior floor
+— we only refresh `extra_sleep` when the new response carries
+bucket info we can trust. This fixes the 404-heavy degenerate case
+(re-running a wipe whose state was lost) where the script would
+otherwise cycle 429→retry→404→floor→429 forever at ~18/min instead
+of the bucket's natural ~30/min.
+
 ### Search endpoint
 
 The `messages/search` endpoint has a separate, much slower limit.
@@ -192,10 +205,9 @@ were optimistic.
 - `deleted` — every ID we've successfully DELETEd OR observed as
   already-gone (404). De-dupes across crashes. Both phases
   pre-filter this set BEFORE any API call:
-  - Export phase strips IDs from the per-channel `targets` list
-    (line ~475 in `discord_wipe.py`).
-  - Catchup phase skips on the inner delete loop (line ~646) and
-    counts only NEW hits in its no-progress guard (line ~634).
+  - Export phase strips IDs from the per-channel `targets` list.
+  - Catchup phase skips on the inner delete loop and counts only
+    NEW hits in its no-progress guard.
   Zero wasted API calls on restart — visible in logs as
   `N/N already done — skip` per channel.
 - `export_consumed` — Phase 1 runs once. Flipped at the end of the
@@ -204,6 +216,60 @@ were optimistic.
 
 The file is saved atomically (`state.json.tmp` + `rename`) every 10
 deletes within a pass, plus once after each scope, plus on `SIGTERM`.
+
+### What `state.deleted` is NOT (the v0.3.0 footgun)
+
+The set looks like a "recently-deleted messages" cache. It is not.
+It is a **monotonically-growing log of every ID this script has ever
+touched.** Specifically: an ID lands in `state.deleted` because we
+just deleted (or observed-gone) a message that was OLDER THAN the
+retention cutoff. Its snowflake timestamp is, by construction, OLD.
+
+v0.3.0 shipped a `State.gc(retention_days)` method that interpreted
+the set the first way — "drop IDs older than 2x retention, they can
+never reappear in a future max_id-bounded search". This was correct
+for messages STILL ON DISCORD. It was catastrophically wrong for
+messages we'd ALREADY DELETED, because by definition every entry in
+`state.deleted` has an old snowflake. The next pass started with a
+blank set, re-issued DELETE against the entire just-deleted backlog,
+Discord answered 404 ("gone") for each, the script re-marked them —
+wasting ~30 redundant DELETEs/min on a live wipe until the operator
+stopped the container.
+
+v0.3.1 (commit `5cbbcb3`) reverted the GC entirely and added a
+regression test (`Bug4_StateDoesNotGcRecentlyDeletedOldMessages`)
+that fires if `hasattr(State, "gc")` ever becomes True again.
+
+If unbounded growth ever becomes a real problem (typical user:
+<100 IDs/day in steady state, ~2MB/year), the correct shape is
+to track **mark-time** per ID (when the script learned about each
+deletion), NOT the message's own snowflake — a state schema change,
+deferred until needed.
+
+### Corrupt-state recovery
+
+On load, if `state.json` fails to parse, the script:
+
+1. Renames the bad file to `state.json.corrupt-<ISO timestamp>`
+   (so an operator can `jq` it later for forensics).
+2. Prints a WARN line naming both paths.
+3. Starts fresh with `deleted=set()` and `export_consumed=False`.
+
+The fresh-start is safe — every "forgotten" ID gets re-issued, hits
+Discord 404 ("gone"), and is re-marked. Slower, not wrong. The
+backup-before-reset is an auditability improvement over v0.2.0
+(which silently discarded the file).
+
+### Identity-change pause
+
+The `cmd_run` pre-flight (one `GET /users/@me` per pass) catches not
+just 401-rejected tokens but also identity changes: if the operator
+rotates `.env` to a *different* account's token, `fresh["id"] !=
+me["id"]` triggers `_auth_paused_exit` with a banner saying
+`was @X (id=...) now @Y (id=...)`. Without this, the script would
+silently search for the original user's messages under the new
+user's permissions — mostly 403s and zero results, but invisible.
+v0.3.0+ behaviour.
 
 ## Resume visibility
 

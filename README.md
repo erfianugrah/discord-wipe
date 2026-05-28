@@ -42,7 +42,7 @@ restarts, and repeat passes never re-attempt the same ID.
 
 ```
 discord-wipe/
-├── discord_wipe.py            single-file script (stdlib + requests)
+├── discord_wipe.py            single-file script (stdlib + requests, ~990 lines)
 ├── Dockerfile                 python:3.12-slim, non-root, PUID=99/PGID=100
 ├── compose.yaml               the stack (pulls ghcr.io/erfianugrah/discord-wipe)
 ├── .env.example               token template
@@ -52,12 +52,14 @@ discord-wipe/
 ├── AGENTS.md                  agent-facing project conventions
 ├── README.md                  this file
 ├── LICENSE                    MIT
+├── tests/                     stdlib unittest, 13 tests
+│   └── test_discord_wipe.py   safety mandate + bug regressions + anti-GC guard
 ├── docs/
 │   ├── DESIGN.md              design rationale + alternatives considered
-│   ├── OPERATIONS.md          deploy / monitor / debug / rotate
+│   ├── OPERATIONS.md          deploy / monitor / debug / rotate / recover
 │   └── TOKEN.md               token lifecycle (no refresh; rotation procedure)
 └── .github/workflows/
-    ├── ci.yml                 ruff + py_compile + docker build smoke
+    ├── ci.yml                 ruff + py_compile + unit tests + docker build smoke
     └── release.yml            multi-arch ghcr.io image build on main + tags
 ```
 
@@ -109,6 +111,9 @@ export DISCORD_TOKEN='your-token-here'
    --export-dir ~/erfi-bot/data/exports/discord/package/Messages \
    --state ./state/state.json \
    --retention-days 7
+
+# Run the test suite (no network; mocks every Discord helper).
+python3 -m unittest discover -s tests -v
 ```
 
 ## Deploy
@@ -180,7 +185,7 @@ docker logs -f discord-wipe
 | What | How |
 |---|---|
 | Status / live log | `ssh servarr docker logs -f discord-wipe` |
-| Count deleted so far | `ssh servarr 'jq ".deleted \| length, .export_consumed, .last_pass_at" /mnt/user/appdata/discord-wipe/state/state.json'` |
+| Count deleted so far | `ssh servarr 'jq ".deleted \| length, .export_consumed, .last_pass_at" /mnt/user/discord-wipe/state/state.json'` |
 | Pause cleanly | `ssh servarr docker stop discord-wipe` (state is saved on SIGTERM) |
 | Resume | `ssh servarr docker start discord-wipe` |
 | Force re-run export phase | stop, edit `state/state.json`, set `"export_consumed": false`, start |
@@ -210,6 +215,16 @@ docker logs -f discord-wipe
 - **HTTP 401** — token rotated by Discord. The daemon prints a FATAL
   banner with rotation steps and parks itself (no restart-loop
   hammering the API). See `docs/TOKEN.md` for the full procedure.
+- **Identity-change** (v0.3.1+) — same banner shape as 401, fires when
+  the per-pass pre-flight `/users/@me` returns a different `id` than
+  the one cached at startup (token was swapped to a different
+  account). Same resolution: edit `.env` back, `docker compose up -d`.
+- **Corrupt state.json** (v0.3.1+) — if the script can't parse
+  `state/state.json` on load it renames it to `state.json.corrupt-<ts>`,
+  logs a WARN, and resumes with empty state. Recovery happens naturally
+  as Discord returns 404 (`gone`) for already-deleted IDs. Plan ~6h
+  extra wall time on the next pass. See `docs/OPERATIONS.md` for
+  forensic recovery of the backup file.
 - **Discord API changes** — the search endpoint occasionally moves
   fields around. If you start seeing `unexpected 4xx` logs, check
   upstream tools (victornpb/undiscord, OrbitalCheese/undiscord-lite)
