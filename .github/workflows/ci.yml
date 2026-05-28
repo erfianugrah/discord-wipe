@@ -18,17 +18,20 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install ruff
-        run: pip install ruff==0.7.4
+      - name: Install ruff + test deps
+        run: pip install ruff==0.7.4 requests
 
       - name: ruff check
-        run: ruff check discord_wipe.py
+        run: ruff check discord_wipe.py tests/
 
       - name: ruff format --check
-        run: ruff format --check discord_wipe.py
+        run: ruff format --check discord_wipe.py tests/
 
       - name: py_compile (syntax sanity)
         run: python -m py_compile discord_wipe.py
+
+      - name: unit tests
+        run: python -m unittest discover -s tests -v
 
   docker-build:
     runs-on: ubuntu-latest

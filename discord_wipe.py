@@ -39,7 +39,6 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import os
 import pathlib
@@ -56,7 +55,7 @@ import requests
 # Constants
 # ---------------------------------------------------------------------------
 
-__version__ = "0.2.0"  # bump on every behaviour change; tag releases as vX.Y.Z
+__version__ = "0.3.0"  # bump on every behaviour change; tag releases as vX.Y.Z
 
 API = "https://discord.com/api/v10"
 DISCORD_EPOCH_MS = 1420070400000  # 2015-01-01T00:00:00Z
@@ -134,7 +133,26 @@ class State:
         try:
             d = json.loads(self.path.read_text())
         except json.JSONDecodeError as e:
-            print(f"[state] WARN: {self.path} is corrupt ({e}); starting fresh", file=sys.stderr)
+            # Move the corrupt file aside so an operator can recover the
+            # set if it mattered. Starting fresh is safe — every ID we
+            # forget will be re-issued, hit 404, classified 'gone', and
+            # re-marked. Slower, not wrong. The backup makes this
+            # auditable rather than silent.
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = self.path.with_name(f"{self.path.name}.corrupt-{ts}")
+            try:
+                self.path.rename(backup)
+                print(
+                    f"[state] WARN: {self.path} is corrupt ({e}); "
+                    f"moved to {backup}; starting fresh",
+                    file=sys.stderr,
+                )
+            except OSError as rename_err:
+                print(
+                    f"[state] WARN: {self.path} is corrupt ({e}); "
+                    f"could not back up ({rename_err}); starting fresh",
+                    file=sys.stderr,
+                )
             return
         self.deleted = set(d.get("deleted", []))
         self.export_consumed = bool(d.get("export_consumed", False))
@@ -155,6 +173,32 @@ class State:
 
     def mark(self, msg_id: str) -> None:
         self.deleted.add(str(msg_id))
+
+    def gc(self, retention_days: float, now: Optional[datetime] = None) -> int:
+        """Drop IDs whose snowflake timestamp is older than 2x retention.
+
+        These IDs can never reappear in any future search bounded by
+        max_id = snowflake_at(now - retention). Keeping them just bloats
+        the JSON file (rewritten every 10 deletes during a pass).
+
+        Returns count dropped. 2x retention gives a comfortable margin
+        around clock skew and pass-interval slack.
+        """
+        if now is None:
+            now = datetime.now(timezone.utc)
+        gc_cutoff_dt = now - timedelta(days=2 * retention_days)
+        gc_cutoff_sf = snowflake_at(gc_cutoff_dt)
+        before = len(self.deleted)
+        # Non-numeric IDs (shouldn't exist but defend) are kept as-is.
+        kept: set[str] = set()
+        for mid in self.deleted:
+            try:
+                if int(mid) >= gc_cutoff_sf:
+                    kept.add(mid)
+            except ValueError:
+                kept.add(mid)
+        self.deleted = kept
+        return before - len(self.deleted)
 
 
 # ---------------------------------------------------------------------------
@@ -442,28 +486,44 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
     )
 
     counters = {"ok": 0, "gone": 0, "forbidden": 0, "skip_recent": 0, "skip_done": 0}
-    # Resume summary upfront: how much was already done, how much is
-    # still left, and how many channels are fully done so the resume
-    # is auditable from the logs alone. Pre-counts all targets (194
-    # small JSON reads, ~2s) which also feeds the running ETA.
+    # Parse every channel's messages.json ONCE up-front. Used both for
+    # the resume summary / ETA pre-count below and for the main loop —
+    # no double-parse, no inconsistent error handling between phases.
+    parsed: dict[str, list[dict]] = {}
+    for ch in channels:
+        try:
+            parsed[ch.id] = json.loads(ch.msgs_path.read_text())
+        except FileNotFoundError:
+            print(f"[export] {ch.id}: no messages.json — skip", file=sys.stderr)
+        except json.JSONDecodeError as e:
+            print(f"[export] {ch.id}: corrupt messages.json ({e}) — skip", file=sys.stderr)
+
+    # Resume summary: how much was already done, how much is still
+    # left, and how many channels are fully done so the resume is
+    # auditable from the logs alone.
     grand_total = 0
     already_done_total = 0
     fully_done_channels = 0
     for ch in channels:
-        with contextlib.suppress(Exception):
-            msgs = json.loads(ch.msgs_path.read_text())
-            grand_total += len(msgs)
+        msgs = parsed.get(ch.id)
+        if msgs is None:
+            continue
+        grand_total += len(msgs)
+        try:
             ch_done = sum(1 for m in msgs if str(m["ID"]) in cfg.state.deleted)
-            already_done_total += ch_done
-            if ch_done == len(msgs):
-                fully_done_channels += 1
+        except (KeyError, TypeError):
+            ch_done = 0
+        already_done_total += ch_done
+        if msgs and ch_done == len(msgs):
+            fully_done_channels += 1
     grand_done = already_done_total
     remaining = grand_total - already_done_total
     t0 = time.monotonic()
     deletes_since_t0 = 0
+    resume_pct = (100.0 * already_done_total / grand_total) if grand_total else 0.0
     print(
         f"[export] resume: {already_done_total}/{grand_total} "
-        f"({100.0 * already_done_total / grand_total:.1f}%) already done "
+        f"({resume_pct:.1f}%) already done "
         f"across {fully_done_channels}/{len(channels)} fully-done channels; "
         f"{remaining} targets remaining"
     )
@@ -475,10 +535,9 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
             print(f"[export {ci}/{len(channels)}] skip excluded {ch.id}")
             continue
 
-        try:
-            msgs = json.loads(ch.msgs_path.read_text())
-        except FileNotFoundError:
-            print(f"[export {ci}/{len(channels)}] {ch.id}: no messages.json")
+        msgs = parsed.get(ch.id)
+        if msgs is None:
+            # Already logged above during pre-parse.
             continue
 
         # Filter to old + not-already-deleted.
@@ -529,6 +588,7 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
                 continue
 
             extra_sleep = 0.0
+            status = "retry"
             while True:
                 status, hint = delete_message(s, ch.id, mid)
                 if status == "retry":
@@ -543,6 +603,14 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
                     continue
                 if status == "ok":
                     extra_sleep = hint
+                break
+
+            if status == "retry":
+                # SIGTERM fired mid-backoff. Do NOT mark — the next
+                # pass's catchup phase will pick this ID up again
+                # via messages/search. Marking now would silently
+                # leak the message (state says done, Discord still
+                # has it). Break the outer loop too; STOP is set.
                 break
 
             if status == "ok":
@@ -675,6 +743,7 @@ def phase_live_catchup(s: requests.Session, cfg: WipeConfig) -> None:
                     continue
 
                 extra_sleep = 0.0
+                status = "retry"
                 while True:
                     status, hint = delete_message(s, cid, mid)
                     if status == "retry":
@@ -687,6 +756,12 @@ def phase_live_catchup(s: requests.Session, cfg: WipeConfig) -> None:
                         extra_sleep = hint
                     break
 
+                if status == "retry":
+                    # SIGTERM mid-backoff. Same reasoning as the
+                    # export phase: do NOT mark. The next pass will
+                    # find the message again via search.
+                    break
+
                 if status == "ok":
                     counters["ok"] += 1
                 elif status == "gone":
@@ -695,7 +770,10 @@ def phase_live_catchup(s: requests.Session, cfg: WipeConfig) -> None:
                     counters["forbidden"] += 1
 
                 cfg.state.mark(mid)
-                time.sleep(cfg.delete_delay + extra_sleep)
+                # max(floor, hint), NOT sum — same rationale as the
+                # export phase. DELETE_DELAY is the safety floor;
+                # extra_sleep is the per-bucket optimal pace.
+                time.sleep(max(cfg.delete_delay, extra_sleep))
 
             cfg.state.save()
             # Wait for search index to catch up before re-querying.
@@ -815,10 +893,26 @@ def cmd_run(args) -> int:
     while True:
         # Pre-flight: catch token rotation between passes before doing
         # expensive work. Costs one HTTP call per pass; negligible.
+        # Also detect identity change — a rotation that lands on a
+        # DIFFERENT account would silently search for the original
+        # user's messages under the new user's permissions. Bail.
         try:
-            get_me(s)
+            fresh = get_me(s)
         except AuthError as e:
             return _auth_paused_exit(_token_hint(args.token), str(e))
+        if fresh["id"] != me["id"]:
+            return _auth_paused_exit(
+                _token_hint(args.token),
+                f"identity changed mid-loop: was @{me.get('username')} "
+                f"(id={me['id']}), now @{fresh.get('username')} (id={fresh['id']})",
+            )
+
+        # GC stale IDs from state. Anything older than 2x retention
+        # can never reappear in search (max_id bounds future hits to
+        # < cutoff = now - retention).
+        dropped = state.gc(args.retention_days)
+        if dropped:
+            print(f"[run] gc: dropped {dropped} IDs older than {2 * args.retention_days:.1f}d")
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=args.retention_days)
         cfg = WipeConfig(

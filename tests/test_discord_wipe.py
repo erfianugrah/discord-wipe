@@ -1,0 +1,467 @@
+"""Tests for discord_wipe.
+
+Covers:
+  - The three safety layers AGENTS.md mandates a test for
+    (only-my-messages defence-in-depth).
+  - Regression tests for the 9 review issues fixed in this PR.
+
+Mocks the HTTP layer at the helper-function boundary
+(delete_message / search_messages / get_me / list_my_guilds /
+list_my_dms) so we exercise the real phase_export / phase_live_catchup
+control flow without touching Discord.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from unittest import mock
+
+import discord_wipe as dw
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_cfg(
+    state: dw.State, *, dry_run: bool = False, delete_delay: float = 0.0
+) -> dw.WipeConfig:
+    return dw.WipeConfig(
+        token="fake",
+        me_id="self-id",
+        state=state,
+        cutoff=datetime(2026, 5, 21, tzinfo=timezone.utc),
+        delete_delay=delete_delay,
+        search_delay=0.0,
+        dry_run=dry_run,
+        exclude_guilds=set(),
+        exclude_channels=set(),
+    )
+
+
+def _write_export(
+    tmp: pathlib.Path, *, channels: list[tuple[str, str, list[dict]]]
+) -> pathlib.Path:
+    """Build a fake export tree.
+
+    channels = [(channel_id, channel_type, [{"ID": "...", "Timestamp": "..."}])].
+    """
+    root = tmp / "Messages"
+    root.mkdir(parents=True)
+    index = {}
+    for cid, ctype, msgs in channels:
+        cdir = root / f"c{cid}"
+        cdir.mkdir()
+        (cdir / "channel.json").write_text(json.dumps({"id": cid, "type": ctype}))
+        (cdir / "messages.json").write_text(json.dumps(msgs))
+        index[cid] = f"name-of-{cid}"
+    (root / "index.json").write_text(json.dumps(index))
+    return root
+
+
+def _reset_stop():
+    """Clear the module-level STOP flag between tests."""
+    dw.STOP = False
+
+
+# ---------------------------------------------------------------------------
+# AGENTS.md mandated safety tests
+# ---------------------------------------------------------------------------
+
+
+class SafetyLayer1_ExportOnlyMyMessages(unittest.TestCase):
+    """Layer 1: export phase only ever sees IDs from c<id>/messages.json,
+    which Discord itself populated with only-my-messages. We can't test
+    Discord's contract — but we CAN test that we read no other source."""
+
+    def test_phase_export_reads_only_messages_json_per_channel(self):
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            export = _write_export(
+                tmp,
+                channels=[
+                    ("100", "DM", [{"ID": "9001", "Timestamp": "2026-05-01 00:00:00"}]),
+                ],
+            )
+            state = dw.State(tmp / "state.json")
+            cfg = _make_cfg(state)
+
+            with (
+                mock.patch.object(dw, "delete_message", return_value=("ok", 0.0)) as dm,
+                mock.patch.object(dw.time, "sleep"),
+            ):
+                dw.phase_export(mock.MagicMock(), cfg, export)
+
+            # Only the one message ID we put in messages.json got deleted.
+            ids = [c.kwargs.get("msg_id") or c.args[2] for c in dm.call_args_list]
+            self.assertEqual(ids, ["9001"])
+
+
+class SafetyLayer2_SearchUsesAuthorId(unittest.TestCase):
+    """Layer 2: catchup phase MUST pass author_id=<self> on every
+    search_messages call. Discord server-side-filters by author."""
+
+    def test_phase_live_catchup_always_passes_author_id_self(self):
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            state = dw.State(tmp / "state.json")
+            cfg = _make_cfg(state)
+            sess = mock.MagicMock()
+
+            # Empty page on every search → scope ends after 2 empty streaks.
+            with (
+                mock.patch.object(dw, "list_my_guilds", return_value=[{"id": "g1", "name": "G"}]),
+                mock.patch.object(
+                    dw,
+                    "list_my_dms",
+                    return_value=[{"id": "d1", "type": 1, "recipients": []}],
+                ),
+                mock.patch.object(dw, "search_messages", return_value=(0, [], None)) as sm,
+                mock.patch.object(dw.time, "sleep"),
+            ):
+                dw.phase_live_catchup(sess, cfg)
+
+            self.assertGreater(sm.call_count, 0)
+            for call in sm.call_args_list:
+                self.assertEqual(
+                    call.kwargs.get("author_id"),
+                    "self-id",
+                    f"search call missing author_id=self: {call}",
+                )
+
+
+class SafetyLayer3_403IsTerminalNotRetried(unittest.TestCase):
+    """Layer 3: a 403 from DELETE must be classified 'forbidden' and the
+    caller must NOT retry it. (If we somehow targeted someone else's
+    message, a 403 from a non-admin scope is what protects us.)"""
+
+    def test_delete_message_returns_forbidden_on_403_without_retry(self):
+        resp = mock.MagicMock()
+        resp.status_code = 403
+        sess = mock.MagicMock()
+        sess.delete.return_value = resp
+        status, hint = dw.delete_message(sess, "chan", "msg")
+        self.assertEqual(status, "forbidden")
+        self.assertEqual(hint, 0.0)
+        # Exactly one HTTP call — no retry loop.
+        self.assertEqual(sess.delete.call_count, 1)
+
+
+# ---------------------------------------------------------------------------
+# Bug 1: SIGTERM during retry must NOT mark message as deleted
+# ---------------------------------------------------------------------------
+
+
+class Bug1_StopDuringRetryMustNotMark(unittest.TestCase):
+    def test_export_does_not_mark_when_sigterm_fires_during_retry(self):
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            export = _write_export(
+                tmp,
+                channels=[
+                    ("100", "DM", [{"ID": "9001", "Timestamp": "2026-05-01 00:00:00"}]),
+                ],
+            )
+            state = dw.State(tmp / "state.json")
+            cfg = _make_cfg(state)
+
+            # First call returns retry; sleep is patched to set STOP.
+            def trigger_stop(*a, **kw):
+                dw.STOP = True
+
+            with (
+                mock.patch.object(dw, "delete_message", return_value=("retry", 0.01)),
+                mock.patch.object(dw.time, "sleep", side_effect=trigger_stop),
+            ):
+                dw.phase_export(mock.MagicMock(), cfg, export)
+
+            self.assertNotIn(
+                "9001", state.deleted, "STOP fired mid-retry; ID must not be marked as deleted"
+            )
+
+    def test_catchup_does_not_mark_when_sigterm_fires_during_retry(self):
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            state = dw.State(tmp / "state.json")
+            cfg = _make_cfg(state)
+            sess = mock.MagicMock()
+
+            def trigger_stop(*a, **kw):
+                dw.STOP = True
+
+            # One non-empty search page, then nothing matters because STOP fires.
+            search_pages = [
+                (1, [{"id": "9002", "channel_id": "c1", "hit": True}], None),
+                (0, [], None),
+            ]
+            with (
+                mock.patch.object(dw, "list_my_guilds", return_value=[]),
+                mock.patch.object(
+                    dw,
+                    "list_my_dms",
+                    return_value=[{"id": "c1", "type": 1, "recipients": []}],
+                ),
+                mock.patch.object(dw, "search_messages", side_effect=search_pages),
+                mock.patch.object(dw, "delete_message", return_value=("retry", 0.01)),
+                mock.patch.object(dw.time, "sleep", side_effect=trigger_stop),
+            ):
+                dw.phase_live_catchup(sess, cfg)
+
+            self.assertNotIn(
+                "9002", state.deleted, "STOP fired mid-retry in catchup; ID must not be marked"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Bug 2: ZeroDivisionError on empty export
+# ---------------------------------------------------------------------------
+
+
+class Bug2_EmptyExportNoZeroDivision(unittest.TestCase):
+    def test_phase_export_handles_empty_messages_json_without_crashing(self):
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            export = _write_export(tmp, channels=[("100", "DM", [])])
+            state = dw.State(tmp / "state.json")
+            cfg = _make_cfg(state)
+            with mock.patch.object(dw.time, "sleep"):
+                # Must not raise.
+                dw.phase_export(mock.MagicMock(), cfg, export)
+
+
+# ---------------------------------------------------------------------------
+# Bug 3: catchup pacing must use max(), not sum
+# ---------------------------------------------------------------------------
+
+
+class Bug3_CatchupPacingMatchesExport(unittest.TestCase):
+    def test_catchup_post_delete_sleep_is_max_floor_or_hint_not_sum(self):
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            state = dw.State(tmp / "state.json")
+            cfg = _make_cfg(state, delete_delay=1.0)
+            sess = mock.MagicMock()
+
+            sleeps: list[float] = []
+            search_pages = [
+                (1, [{"id": "9003", "channel_id": "c1", "hit": True}], None),
+                (0, [], None),
+                (0, [], None),
+            ]
+            # Bucket hint 0.6s, floor 1.0s — expected post-delete sleep is max=1.0.
+            with (
+                mock.patch.object(dw, "list_my_guilds", return_value=[]),
+                mock.patch.object(
+                    dw,
+                    "list_my_dms",
+                    return_value=[{"id": "c1", "type": 1, "recipients": []}],
+                ),
+                mock.patch.object(dw, "search_messages", side_effect=search_pages),
+                mock.patch.object(dw, "delete_message", return_value=("ok", 0.6)),
+                mock.patch.object(dw.time, "sleep", side_effect=lambda s: sleeps.append(s)),
+            ):
+                dw.phase_live_catchup(sess, cfg)
+
+            # Find a 1.0 (max) sleep, NOT a 1.6 (sum). delta = floor+hint=1.6
+            self.assertIn(1.0, sleeps, f"expected max(1.0, 0.6)=1.0 sleep, got {sleeps}")
+            self.assertNotIn(1.6, sleeps, f"catchup still summing: {sleeps}")
+
+
+# ---------------------------------------------------------------------------
+# Bug 4: state.deleted must garbage-collect old IDs
+# ---------------------------------------------------------------------------
+
+
+class Bug4_StateDeletedGarbageCollected(unittest.TestCase):
+    def test_save_drops_ids_older_than_2x_retention(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            state = dw.State(tmp / "state.json")
+
+            # Old snowflake (well outside 2x retention window).
+            # Recent snowflake (well inside it).
+            now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+            old_dt = now - timedelta(days=30)  # 30 days old; outside 14d window
+            new_dt = now - timedelta(days=3)  # 3 days old; inside
+            old_id = str(dw.snowflake_at(old_dt))
+            new_id = str(dw.snowflake_at(new_dt))
+            state.mark(old_id)
+            state.mark(new_id)
+
+            dropped = state.gc(retention_days=7.0, now=now)
+            state.save()
+
+            self.assertEqual(dropped, 1)
+            self.assertNotIn(old_id, state.deleted)
+            self.assertIn(new_id, state.deleted)
+
+
+# ---------------------------------------------------------------------------
+# Bug 5: pre-count cache prevents double-parse
+# ---------------------------------------------------------------------------
+
+
+class Bug5_MessagesJsonParsedOncePerPass(unittest.TestCase):
+    def test_messages_json_read_once_per_channel_per_pass(self):
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            export = _write_export(
+                tmp,
+                channels=[
+                    ("100", "DM", [{"ID": "9001", "Timestamp": "2026-05-01 00:00:00"}]),
+                ],
+            )
+            state = dw.State(tmp / "state.json")
+            cfg = _make_cfg(state)
+
+            real_read_text = pathlib.Path.read_text
+            read_counts: dict[str, int] = {}
+
+            def counting_read(self, *a, **kw):
+                if self.name == "messages.json":
+                    read_counts[str(self)] = read_counts.get(str(self), 0) + 1
+                return real_read_text(self, *a, **kw)
+
+            with (
+                mock.patch.object(pathlib.Path, "read_text", counting_read),
+                mock.patch.object(dw, "delete_message", return_value=("ok", 0.0)),
+                mock.patch.object(dw.time, "sleep"),
+            ):
+                dw.phase_export(mock.MagicMock(), cfg, export)
+
+            for path, n in read_counts.items():
+                self.assertEqual(n, 1, f"{path} read {n} times; expected 1")
+
+
+# ---------------------------------------------------------------------------
+# Bug 6: corrupt state.json is backed up before reset
+# ---------------------------------------------------------------------------
+
+
+class Bug6_CorruptStateIsBackedUp(unittest.TestCase):
+    def test_corrupt_state_json_renamed_to_backup_on_load(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            sp = tmp / "state.json"
+            sp.write_text("{ not json")
+            state = dw.State(sp)
+            # The corrupt file should have been renamed, not vanished.
+            backups = list(tmp.glob("state.json.corrupt-*"))
+            self.assertEqual(len(backups), 1, f"expected one backup; got {list(tmp.iterdir())}")
+            self.assertEqual(backups[0].read_text(), "{ not json")
+            self.assertEqual(state.deleted, set())
+
+
+# ---------------------------------------------------------------------------
+# Bug 7: main loop survives corrupt messages.json (matches pre-count suppress)
+# ---------------------------------------------------------------------------
+
+
+class Bug7_CorruptMessagesJsonDoesNotCrashPass(unittest.TestCase):
+    def test_main_loop_skips_channel_with_corrupt_messages_json(self):
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            export = _write_export(
+                tmp,
+                channels=[
+                    ("100", "DM", [{"ID": "9001", "Timestamp": "2026-05-01 00:00:00"}]),
+                    ("200", "DM", [{"ID": "9002", "Timestamp": "2026-05-01 00:00:00"}]),
+                ],
+            )
+            # Corrupt channel 100's messages.json AFTER tree is built.
+            (export / "c100" / "messages.json").write_text("{ broken")
+            state = dw.State(tmp / "state.json")
+            cfg = _make_cfg(state)
+
+            with (
+                mock.patch.object(dw, "delete_message", return_value=("ok", 0.0)),
+                mock.patch.object(dw.time, "sleep"),
+            ):
+                # Must not raise.
+                dw.phase_export(mock.MagicMock(), cfg, export)
+
+            # Channel 200 still got its delete; 100 was skipped.
+            self.assertIn("9002", state.deleted)
+            self.assertNotIn("9001", state.deleted)
+
+
+# ---------------------------------------------------------------------------
+# Bug 8: pre-flight refreshes me_id; bails on identity change
+# ---------------------------------------------------------------------------
+
+
+class Bug8_PreflightRefreshesIdentity(unittest.TestCase):
+    def test_cmd_run_bails_when_token_swap_changes_user_id(self):
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            state_path = tmp / "state.json"
+            export_dir = tmp / "no-export"  # doesn't exist; export phase skipped
+            args = argparse.Namespace(
+                token="fake",
+                state=state_path,
+                export_dir=export_dir,
+                retention_days=7.0,
+                delete_delay=0.0,
+                search_delay=0.0,
+                interval_hours=24.0,
+                watch=False,
+                dry_run=True,
+                exclude_guild=[],
+                exclude_channel=[],
+            )
+
+            # First get_me returns user A; SECOND (pre-flight) returns user B.
+            call_count = {"n": 0}
+
+            def fake_get_me(_sess):
+                call_count["n"] += 1
+                return (
+                    {"id": "user-A", "username": "a"}
+                    if call_count["n"] == 1
+                    else {"id": "user-B", "username": "b"}
+                )
+
+            # _auth_paused_exit spins on `while not STOP: time.sleep(5)`,
+            # so the patched sleep must flip STOP to exit. Pre-flight
+            # itself doesn't sleep, so the first sleep call IS the
+            # paused-exit one — setting STOP there is correct.
+            def sleep_then_stop(*_a, **_kw):
+                dw.STOP = True
+
+            # If pre-flight does NOT detect the swap, the loop reaches
+            # phase_live_catchup which calls list_my_guilds. We assert
+            # that never happens.
+            with (
+                mock.patch.object(dw, "get_me", side_effect=fake_get_me),
+                mock.patch.object(dw, "list_my_guilds", return_value=[]) as gl,
+                mock.patch.object(dw, "list_my_dms", return_value=[]) as dl,
+                mock.patch.object(dw.time, "sleep", side_effect=sleep_then_stop),
+            ):
+                rc = dw.cmd_run(args)
+
+            self.assertEqual(rc, 0)  # paused-exit returns 0
+            self.assertEqual(
+                gl.call_count,
+                0,
+                "identity swap was not detected; phase_live_catchup ran under stale me_id",
+            )
+            self.assertEqual(dl.call_count, 0)
+            self.assertGreaterEqual(call_count["n"], 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
