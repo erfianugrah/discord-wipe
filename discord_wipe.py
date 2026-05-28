@@ -39,6 +39,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import pathlib
@@ -285,10 +286,29 @@ def delete_message(s: requests.Session, channel_id: str, msg_id: str) -> tuple[s
     _check_auth(r)
 
     if r.status_code == 204:
-        # Honor preemptive bucket-empty hint to avoid the next 429.
-        rem = r.headers.get("X-RateLimit-Remaining", "")
+        # Precise pacing via Discord's per-bucket rate-limit headers.
+        # Discord publishes:
+        #   X-RateLimit-Limit         max requests in this bucket window
+        #   X-RateLimit-Remaining     requests left in current window
+        #   X-RateLimit-Reset-After   seconds until the bucket refills
+        #   X-RateLimit-Bucket        opaque bucket id
+        #
+        # Optimal pacing = Reset-After / Remaining — spreads the quota
+        # evenly so we never tip into a 429. If Remaining is 0 we wait
+        # the full window. The caller takes max(DELETE_DELAY, hint) so
+        # DELETE_DELAY remains a safety floor against account-level
+        # abuse detection (which is independent of per-route buckets).
+        rem_s = r.headers.get("X-RateLimit-Remaining", "")
         reset = float(r.headers.get("X-RateLimit-Reset-After", "0") or 0)
-        return "ok", reset if rem == "0" and reset > 0 else 0.0
+        try:
+            rem = int(rem_s) if rem_s != "" else -1
+        except ValueError:
+            rem = -1
+        if rem == 0 and reset > 0:
+            return "ok", reset  # bucket empty: wait full window
+        if rem > 0 and reset > 0:
+            return "ok", reset / rem  # spread the remaining quota
+        return "ok", 0.0
 
     if r.status_code == 404:
         return "gone", 0.0
@@ -394,6 +414,19 @@ class WipeConfig:
     exclude_channels: set[str]
 
 
+def _format_eta(seconds: float) -> str:
+    """Human-friendly ETA string for progress logs (e.g. '22h13m', '4m12s')."""
+    if seconds < 0 or seconds != seconds:  # NaN-safe
+        return "?"
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds // 60:.0f}m{seconds % 60:.0f}s"
+    hours = seconds // 3600
+    mins = (seconds % 3600) // 60
+    return f"{hours:.0f}h{mins:.0f}m"
+
+
 def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path) -> None:
     """Delete every message in the export with timestamp < cutoff."""
     if cfg.state.export_consumed:
@@ -409,6 +442,18 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
     )
 
     counters = {"ok": 0, "gone": 0, "forbidden": 0, "skip_recent": 0, "skip_done": 0}
+    # Overall progress tracking. grand_total is the denominator for the
+    # "X/Y total" line printed every 10 deletes; t0 anchors the running
+    # throughput estimate. Pre-counting all targets means 194 small JSON
+    # reads upfront (~2s) but gives accurate ETAs from the first delete.
+    grand_total = 0
+    for ch in channels:
+        with contextlib.suppress(Exception):
+            grand_total += len(json.loads(ch.msgs_path.read_text()))
+    grand_done = len(cfg.state.deleted)
+    t0 = time.monotonic()
+    deletes_since_t0 = 0
+    print(f"[export] {grand_total} total message IDs in export; resuming from {grand_done}")
 
     for ci, ch in enumerate(channels, 1):
         if STOP:
@@ -456,13 +501,19 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
                 # double-count the same IDs. Real-run state hygiene is
                 # protected by the separate-state-file convention.
                 cfg.state.mark(mid)
+                grand_done += 1
+                deletes_since_t0 += 1
                 continue
 
             extra_sleep = 0.0
             while True:
                 status, hint = delete_message(s, ch.id, mid)
                 if status == "retry":
-                    print(f"  rate-limited; sleep {hint:.1f}s", file=sys.stderr)
+                    # Quiet log: routine sub-second 429s from bucket
+                    # edge are expected and floodful; only print the
+                    # noteworthy ones (≥1s) and 5xx retries.
+                    if hint >= 1.0:
+                        print(f"  rate-limited; sleep {hint:.1f}s", file=sys.stderr)
                     time.sleep(hint)
                     if STOP:
                         break
@@ -479,14 +530,28 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
                 counters["forbidden"] += 1
 
             cfg.state.mark(mid)
+            grand_done += 1
+            deletes_since_t0 += 1
 
-            if j % 25 == 0:
+            if j % 10 == 0:
                 cfg.state.save()
+                elapsed = time.monotonic() - t0
+                rate = deletes_since_t0 / elapsed if elapsed > 0 else 0
+                remaining = max(0, grand_total - grand_done)
+                eta = remaining / rate if rate > 0 else 0
+                pct = 100.0 * grand_done / grand_total if grand_total else 0
                 print(
                     f"    {j}/{len(targets)} ok={counters['ok']} "
-                    f"gone={counters['gone']} 403={counters['forbidden']}"
+                    f"gone={counters['gone']} 403={counters['forbidden']} "
+                    f"| total: {grand_done}/{grand_total} ({pct:.1f}%) "
+                    f"~{rate * 60:.0f}/min ETA {_format_eta(eta)}"
                 )
-            time.sleep(cfg.delete_delay + extra_sleep)
+            # max(floor, header-driven hint), NOT sum. DELETE_DELAY is
+            # the safety floor against account-level abuse heuristics;
+            # extra_sleep is the per-bucket optimal pace. When the
+            # bucket has slack, the floor wins; when the bucket is
+            # tight, the header wins.
+            time.sleep(max(cfg.delete_delay, extra_sleep))
 
         cfg.state.save()
 
