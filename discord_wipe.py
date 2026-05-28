@@ -55,7 +55,7 @@ import requests
 # Constants
 # ---------------------------------------------------------------------------
 
-__version__ = "0.3.0"  # bump on every behaviour change; tag releases as vX.Y.Z
+__version__ = "0.3.1"  # bump on every behaviour change; tag releases as vX.Y.Z
 
 API = "https://discord.com/api/v10"
 DISCORD_EPOCH_MS = 1420070400000  # 2015-01-01T00:00:00Z
@@ -174,31 +174,22 @@ class State:
     def mark(self, msg_id: str) -> None:
         self.deleted.add(str(msg_id))
 
-    def gc(self, retention_days: float, now: Optional[datetime] = None) -> int:
-        """Drop IDs whose snowflake timestamp is older than 2x retention.
-
-        These IDs can never reappear in any future search bounded by
-        max_id = snowflake_at(now - retention). Keeping them just bloats
-        the JSON file (rewritten every 10 deletes during a pass).
-
-        Returns count dropped. 2x retention gives a comfortable margin
-        around clock skew and pass-interval slack.
-        """
-        if now is None:
-            now = datetime.now(timezone.utc)
-        gc_cutoff_dt = now - timedelta(days=2 * retention_days)
-        gc_cutoff_sf = snowflake_at(gc_cutoff_dt)
-        before = len(self.deleted)
-        # Non-numeric IDs (shouldn't exist but defend) are kept as-is.
-        kept: set[str] = set()
-        for mid in self.deleted:
-            try:
-                if int(mid) >= gc_cutoff_sf:
-                    kept.add(mid)
-            except ValueError:
-                kept.add(mid)
-        self.deleted = kept
-        return before - len(self.deleted)
+    # DO NOT add a snowflake-timestamp-based gc() here.
+    #
+    # IDs in self.deleted are IDs of messages we DELETED — i.e. messages
+    # that were OLDER than the retention cutoff. Their snowflake
+    # timestamps are therefore OLD by definition. Any GC that drops
+    # "IDs older than X" will sweep out the IDs we just successfully
+    # processed, causing the next pass to re-attempt 100% of them
+    # against Discord (each one returning 404 “gone”). Past commit
+    # fc1b289 (v0.3.0) shipped exactly that bug and burned ~8h of
+    # API calls on a live wipe. See AGENTS.md "Hard safety rules".
+    #
+    # If unbounded growth becomes a real problem (typical user: <100
+    # IDs/day in steady state, ~2MB/year), the correct fix is to track
+    # MARK-TIME per ID (timestamp the script learned about the
+    # deletion), not the message's own snowflake. That needs a state
+    # schema change. Until then, growth is bounded by activity.
 
 
 # ---------------------------------------------------------------------------
@@ -906,13 +897,6 @@ def cmd_run(args) -> int:
                 f"identity changed mid-loop: was @{me.get('username')} "
                 f"(id={me['id']}), now @{fresh.get('username')} (id={fresh['id']})",
             )
-
-        # GC stale IDs from state. Anything older than 2x retention
-        # can never reappear in search (max_id bounds future hits to
-        # < cutoff = now - retention).
-        dropped = state.gc(args.retention_days)
-        if dropped:
-            print(f"[run] gc: dropped {dropped} IDs older than {2 * args.retention_days:.1f}d")
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=args.retention_days)
         cfg = WipeConfig(

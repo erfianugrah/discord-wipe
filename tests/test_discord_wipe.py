@@ -279,32 +279,50 @@ class Bug3_CatchupPacingMatchesExport(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Bug 4: state.deleted must garbage-collect old IDs
+# Bug 4 (REGRESSION): State must NOT GC by message snowflake age.
+# v0.3.0 shipped a State.gc(retention_days) that dropped IDs whose
+# snowflake_ts was older than 2x retention. But state.deleted holds
+# IDs of messages we DELETED — i.e. messages that were older than the
+# retention cutoff in the first place — so the GC swept out the
+# entire just-deleted set on the next pass. This guards against
+# anyone reintroducing that pattern.
 # ---------------------------------------------------------------------------
 
 
-class Bug4_StateDeletedGarbageCollected(unittest.TestCase):
-    def test_save_drops_ids_older_than_2x_retention(self):
+class Bug4_StateDoesNotGcRecentlyDeletedOldMessages(unittest.TestCase):
+    def test_round_trip_preserves_ids_with_old_snowflakes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = pathlib.Path(tmpdir)
-            state = dw.State(tmp / "state.json")
+            sp = tmp / "state.json"
+            state = dw.State(sp)
 
-            # Old snowflake (well outside 2x retention window).
-            # Recent snowflake (well inside it).
+            # Mark IDs whose snowflake_ts is well outside retention — these
+            # represent messages we JUST deleted (because they were old).
             now = datetime(2026, 5, 28, tzinfo=timezone.utc)
-            old_dt = now - timedelta(days=30)  # 30 days old; outside 14d window
-            new_dt = now - timedelta(days=3)  # 3 days old; inside
-            old_id = str(dw.snowflake_at(old_dt))
-            new_id = str(dw.snowflake_at(new_dt))
-            state.mark(old_id)
-            state.mark(new_id)
-
-            dropped = state.gc(retention_days=7.0, now=now)
+            ids = [str(dw.snowflake_at(now - timedelta(days=age))) for age in (10, 30, 365)]
+            for mid in ids:
+                state.mark(mid)
             state.save()
 
-            self.assertEqual(dropped, 1)
-            self.assertNotIn(old_id, state.deleted)
-            self.assertIn(new_id, state.deleted)
+            # Re-load (simulates a container restart between passes).
+            reloaded = dw.State(sp)
+            for mid in ids:
+                self.assertIn(
+                    mid,
+                    reloaded.deleted,
+                    "recently-marked ID with old snowflake_ts was lost on round-trip; "
+                    "a snowflake-based GC must NOT be reintroduced (see comment in State)",
+                )
+
+    def test_state_has_no_snowflake_based_gc_method(self):
+        # If a future change reintroduces State.gc(retention_days=...),
+        # this test fires — forcing the author to read the comment in
+        # State.mark() explaining why that was wrong.
+        self.assertFalse(
+            hasattr(dw.State, "gc"),
+            "State.gc() was the v0.3.0 footgun — do not reintroduce. "
+            "See the comment block above State.mark().",
+        )
 
 
 # ---------------------------------------------------------------------------
