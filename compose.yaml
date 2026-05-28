@@ -1,0 +1,39 @@
+# discord-wipe stack.
+#
+# Deploy on servarr at /mnt/user/appdata/discord-wipe/.
+# Bring-up: `docker compose up -d --build && docker compose logs -f`.
+#
+# Token lives in ./.env (DISCORD_TOKEN=...). Never commit that file.
+# Export sits at ./export/Messages/. State persists at ./state/.
+
+services:
+  discord-wipe:
+    build:
+      context: .
+    image: discord-wipe:local
+    container_name: discord-wipe
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      RETENTION_DAYS: "7"
+      DELETE_DELAY: "1.0"
+      SEARCH_DELAY: "30.0"
+      INTERVAL_HOURS: "24"
+      WATCH: "1"
+      TZ: "Europe/Amsterdam"
+    volumes:
+      - ./export:/data/export:ro
+      - ./state:/data/state
+    # No inbound network. Default bridge with outbound-only is plenty.
+    # Resource caps so a runaway loop can't eat the host.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "256M"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

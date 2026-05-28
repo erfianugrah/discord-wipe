@@ -1,0 +1,23 @@
+# Secrets — NEVER commit.
+.env
+
+# Runtime state.
+state/
+*.tmp
+*.json.tmp
+
+# The Discord export contains every DM you've ever sent.
+# Bind-mount it at runtime; do not ship it inside the repo.
+export/
+
+# Python ephemera.
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Editor / OS.
+.DS_Store
+.vscode/
+.idea/
