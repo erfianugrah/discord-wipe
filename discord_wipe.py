@@ -293,6 +293,29 @@ def delete_message(s: requests.Session, channel_id: str, msg_id: str) -> tuple[s
     if r.status_code == 404:
         return "gone", 0.0
 
+    if r.status_code == 400:
+        # Discord uses HTTP 400 with a semantic `code` field for terminal
+        # errors that retrying will never fix:
+        #   50083  Thread is archived. Cannot delete messages in archived
+        #          threads without unarchiving first; we don't have
+        #          MANAGE_THREADS in most servers, so skip.
+        #   50001  Missing access (channel revoked since export).
+        #   50021  Cannot execute action on a system message.
+        #   50034  Message too old to bulk-delete (we don't bulk-delete,
+        #          but Discord sometimes returns this on archived stuff).
+        #   160005 Thread is locked.
+        # All are non-retryable. Log once, count as forbidden, move on.
+        try:
+            code = int(r.json().get("code", 0))
+            msg = r.json().get("message", "")
+        except Exception:
+            code, msg = 0, r.text[:120]
+        print(
+            f"[delete] terminal 400 code={code} for {channel_id}/{msg_id}: {msg}",
+            file=sys.stderr,
+        )
+        return "forbidden", 0.0
+
     if r.status_code == 403:
         return "forbidden", 0.0
 
