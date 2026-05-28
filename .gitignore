@@ -21,3 +21,11 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+
+# Tooling caches.
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Dry-run state — separate from production state but still local-only.
+state-*/

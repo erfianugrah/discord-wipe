@@ -47,13 +47,15 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterator, Optional
+from typing import Optional
 
 import requests
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+__version__ = "0.2.0"  # bump on every behaviour change; tag releases as vX.Y.Z
 
 API = "https://discord.com/api/v10"
 DISCORD_EPOCH_MS = 1420070400000  # 2015-01-01T00:00:00Z
@@ -131,8 +133,7 @@ class State:
         try:
             d = json.loads(self.path.read_text())
         except json.JSONDecodeError as e:
-            print(f"[state] WARN: {self.path} is corrupt ({e}); starting fresh",
-                  file=sys.stderr)
+            print(f"[state] WARN: {self.path} is corrupt ({e}); starting fresh", file=sys.stderr)
             return
         self.deleted = set(d.get("deleted", []))
         self.export_consumed = bool(d.get("export_consumed", False))
@@ -140,11 +141,15 @@ class State:
 
     def save(self) -> None:
         tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({
-            "deleted": sorted(self.deleted),
-            "export_consumed": self.export_consumed,
-            "last_pass_at": self.last_pass_at,
-        }))
+        tmp.write_text(
+            json.dumps(
+                {
+                    "deleted": sorted(self.deleted),
+                    "export_consumed": self.export_consumed,
+                    "last_pass_at": self.last_pass_at,
+                }
+            )
+        )
         tmp.replace(self.path)
 
     def mark(self, msg_id: str) -> None:
@@ -156,30 +161,55 @@ class State:
 # ---------------------------------------------------------------------------
 
 
+class AuthError(RuntimeError):
+    """Token rejected by Discord (401). Caller must stop and ask the human
+    to rotate the token — there is no refresh flow for user tokens."""
+
+
+def _check_auth(r: requests.Response) -> None:
+    """Raise AuthError on 401 instead of generic HTTPError.
+
+    Discord returns 401 with body {"message": "401: Unauthorized", "code": 0}
+    when the token is invalid / revoked / rotated. Treat that as a terminal
+    condition — retrying will only attract more abuse-detection attention.
+    """
+    if r.status_code == 401:
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text[:200]}
+        raise AuthError(f"Discord rejected the token (401): {body}")
+
+
 def make_session(token: str) -> requests.Session:
     s = requests.Session()
-    s.headers.update({
-        "Authorization": token,
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json",
-    })
+    s.headers.update(
+        {
+            "Authorization": token,
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+        }
+    )
     return s
 
 
 def get_me(s: requests.Session) -> dict:
     r = s.get(f"{API}/users/@me", timeout=30)
+    _check_auth(r)
     r.raise_for_status()
     return r.json()
 
 
 def list_my_guilds(s: requests.Session) -> list[dict]:
     r = s.get(f"{API}/users/@me/guilds", timeout=30)
+    _check_auth(r)
     r.raise_for_status()
     return r.json()
 
 
 def list_my_dms(s: requests.Session) -> list[dict]:
     r = s.get(f"{API}/users/@me/channels", timeout=30)
+    _check_auth(r)
     r.raise_for_status()
     return r.json()
 
@@ -187,7 +217,7 @@ def list_my_dms(s: requests.Session) -> list[dict]:
 def search_messages(
     s: requests.Session,
     *,
-    scope: str,         # "guild" or "channel"
+    scope: str,  # "guild" or "channel"
     scope_id: str,
     author_id: str,
     max_id: int,
@@ -210,6 +240,7 @@ def search_messages(
         "include_nsfw": "true",
     }
     r = s.get(url, params=params, timeout=60)
+    _check_auth(r)
 
     if r.status_code == 429:
         try:
@@ -240,9 +271,7 @@ def search_messages(
     return body.get("total_results", 0), msgs, None
 
 
-def delete_message(
-    s: requests.Session, channel_id: str, msg_id: str
-) -> tuple[str, float]:
+def delete_message(s: requests.Session, channel_id: str, msg_id: str) -> tuple[str, float]:
     """Delete one message.
 
     Returns (status, sleep_hint_seconds):
@@ -253,6 +282,7 @@ def delete_message(
     """
     url = f"{API}/channels/{channel_id}/messages/{msg_id}"
     r = s.delete(url, timeout=30)
+    _check_auth(r)
 
     if r.status_code == 204:
         # Honor preemptive bucket-empty hint to avoid the next 429.
@@ -277,8 +307,7 @@ def delete_message(
         return "retry", 5.0
 
     print(
-        f"[delete] unexpected {r.status_code} for {channel_id}/{msg_id}: "
-        f"{r.text[:200]}",
+        f"[delete] unexpected {r.status_code} for {channel_id}/{msg_id}: {r.text[:200]}",
         file=sys.stderr,
     )
     return "retry", 2.0
@@ -292,8 +321,8 @@ def delete_message(
 @dataclass
 class ExportChannel:
     id: str
-    type: str            # "DM" | "GROUP_DM" | "GUILD_TEXT" | ...
-    name: str            # human-readable from index.json
+    type: str  # "DM" | "GROUP_DM" | "GUILD_TEXT" | ...
+    name: str  # human-readable from index.json
     msgs_path: pathlib.Path
 
 
@@ -308,12 +337,14 @@ def read_export(export_dir: pathlib.Path) -> list[ExportChannel]:
             continue
         cid = d.name[1:]
         ch_meta = json.loads((d / "channel.json").read_text())
-        out.append(ExportChannel(
-            id=cid,
-            type=ch_meta.get("type", "UNKNOWN"),
-            name=index.get(cid, "?"),
-            msgs_path=d / "messages.json",
-        ))
+        out.append(
+            ExportChannel(
+                id=cid,
+                type=ch_meta.get("type", "UNKNOWN"),
+                name=index.get(cid, "?"),
+                msgs_path=d / "messages.json",
+            )
+        )
     return out
 
 
@@ -349,8 +380,10 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
     print(f"[export] reading {export_dir}")
     channels = read_export(export_dir)
     cutoff_local = cfg.cutoff
-    print(f"[export] {len(channels)} channels in export; "
-          f"deleting messages older than {cutoff_local.isoformat()}")
+    print(
+        f"[export] {len(channels)} channels in export; "
+        f"deleting messages older than {cutoff_local.isoformat()}"
+    )
 
     counters = {"ok": 0, "gone": 0, "forbidden": 0, "skip_recent": 0, "skip_done": 0}
 
@@ -450,8 +483,10 @@ def phase_live_catchup(s: requests.Session, cfg: WipeConfig) -> None:
 
     guilds = list_my_guilds(s)
     dms = list_my_dms(s)
-    print(f"[catchup] {len(guilds)} guilds, {len(dms)} DM channels; "
-          f"cutoff={cfg.cutoff.isoformat()} (snowflake={cutoff_snowflake})")
+    print(
+        f"[catchup] {len(guilds)} guilds, {len(dms)} DM channels; "
+        f"cutoff={cfg.cutoff.isoformat()} (snowflake={cutoff_snowflake})"
+    )
 
     counters = {"ok": 0, "gone": 0, "forbidden": 0}
 
@@ -508,17 +543,12 @@ def phase_live_catchup(s: requests.Session, cfg: WipeConfig) -> None:
             # place, and a stale search index can also re-serve already
             # deleted IDs. If every hit on this page is already marked,
             # the scope is effectively done.
-            new_in_page = sum(
-                1 for m in hits if str(m["id"]) not in cfg.state.deleted
-            )
+            new_in_page = sum(1 for m in hits if str(m["id"]) not in cfg.state.deleted)
             if new_in_page == 0:
                 print(f"  page: {len(hits)} hits, all already done; scope finished")
                 break
 
-            print(
-                f"  page: {len(hits)} hits ({new_in_page} new, "
-                f"search reports total={total})"
-            )
+            print(f"  page: {len(hits)} hits ({new_in_page} new, search reports total={total})")
 
             # Hits are author-filtered + max_id-bounded server-side.
             for m in hits:
@@ -570,7 +600,11 @@ def phase_live_catchup(s: requests.Session, cfg: WipeConfig) -> None:
 
 def cmd_verify(args) -> int:
     s = make_session(args.token)
-    me = get_me(s)
+    try:
+        me = get_me(s)
+    except AuthError as e:
+        print(f"FAIL — {e}", file=sys.stderr)
+        return 2
     print(f"OK — @{me.get('username', '?')} (id={me['id']})")
     return 0
 
@@ -610,17 +644,71 @@ def cmd_discover(args) -> int:
     return 0
 
 
+def _auth_paused_exit(token_hint: str, reason: str) -> int:
+    """Discord rejected our token. Park the container until SIGTERM.
+
+    Critical safety behaviour: do NOT exit non-zero in a tight loop. With
+    Docker's `restart: unless-stopped` policy that would re-launch us
+    immediately, hitting Discord again with the same dead token — a fast
+    track to abuse-flagging the account. Sleep for a long time instead;
+    `docker compose up -d` with a new .env will SIGTERM us awake.
+    """
+    print(
+        "\n" + "=" * 72 + "\n"
+        "[FATAL] DISCORD TOKEN REJECTED.\n\n"
+        f"reason: {reason}\n"
+        f"token: {token_hint}\n\n"
+        "Discord user tokens have NO refresh flow. Causes:\n"
+        "  - You logged out / logged back in (issues a new token).\n"
+        "  - You changed your password.\n"
+        "  - Discord rotated it (suspected abuse / token-theft scanner).\n\n"
+        "To rotate:\n"
+        "  1. Grab the new Authorization header from DevTools.\n"
+        "  2. Edit /mnt/user/appdata/discord-wipe/.env on servarr.\n"
+        "  3. `docker compose up -d` (recreates the container with the\n"
+        "     new env, sending us a graceful SIGTERM).\n\n"
+        "Sleeping until SIGTERM. Container stays alive but idle so\n"
+        "restart-unless-stopped doesn't spin and the dashboard shows\n"
+        "a clear cause.\n" + "=" * 72,
+        file=sys.stderr,
+        flush=True,
+    )
+    # Sleep in 5s chunks so SIGTERM is responsive.
+    while not STOP:
+        time.sleep(5)
+    return 0
+
+
+def _token_hint(token: str) -> str:
+    """Safe-to-log token fingerprint (never the secret itself)."""
+    if not token:
+        return "(empty)"
+    return f"{token[:6]}...{token[-4:]} (len={len(token)})"
+
+
 def cmd_run(args) -> int:
     install_signal_handlers()
     s = make_session(args.token)
-    me = get_me(s)
+    try:
+        me = get_me(s)
+    except AuthError as e:
+        return _auth_paused_exit(_token_hint(args.token), str(e))
     print(f"[run] authenticated as @{me.get('username')} (id={me['id']})")
 
     state = State(args.state)
-    print(f"[run] state: {args.state} ({len(state.deleted)} IDs already done; "
-          f"export_consumed={state.export_consumed})")
+    print(
+        f"[run] state: {args.state} ({len(state.deleted)} IDs already done; "
+        f"export_consumed={state.export_consumed})"
+    )
 
     while True:
+        # Pre-flight: catch token rotation between passes before doing
+        # expensive work. Costs one HTTP call per pass; negligible.
+        try:
+            get_me(s)
+        except AuthError as e:
+            return _auth_paused_exit(_token_hint(args.token), str(e))
+
         cutoff = datetime.now(timezone.utc) - timedelta(days=args.retention_days)
         cfg = WipeConfig(
             token=args.token,
@@ -646,9 +734,11 @@ def cmd_run(args) -> int:
             if not STOP:
                 phase_live_catchup(s, cfg)
 
+        except AuthError as e:
+            return _auth_paused_exit(_token_hint(args.token), str(e))
+
         except requests.HTTPError as e:
-            print(f"[run] HTTP error: {e} {getattr(e.response, 'text', '')[:300]}",
-                  file=sys.stderr)
+            print(f"[run] HTTP error: {e} {getattr(e.response, 'text', '')[:300]}", file=sys.stderr)
 
         state.last_pass_at = datetime.now(timezone.utc).isoformat()
         state.save()
@@ -717,7 +807,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(os.environ.get("SEARCH_DELAY", "30.0")),
         help="seconds between search-API page fetches; "
-             "long enough for the search index to refresh (default 30)",
+        "long enough for the search index to refresh (default 30)",
     )
     p.add_argument(
         "--interval-hours",
@@ -725,15 +815,15 @@ def parse_args() -> argparse.Namespace:
         default=float(os.environ.get("INTERVAL_HOURS", "24")),
         help="hours between passes when --watch is set (default 24)",
     )
-    p.add_argument("--watch", action="store_true",
-                   default=os.environ.get("WATCH", "").lower() in {"1", "true", "yes"},
-                   help="loop forever instead of single pass (env WATCH=1)")
-    p.add_argument("--dry-run", action="store_true",
-                   help="don't actually delete; just report")
-    p.add_argument("--exclude-guild", action="append",
-                   help="guild ID to skip (repeatable)")
-    p.add_argument("--exclude-channel", action="append",
-                   help="channel/DM ID to skip (repeatable)")
+    p.add_argument(
+        "--watch",
+        action="store_true",
+        default=os.environ.get("WATCH", "").lower() in {"1", "true", "yes"},
+        help="loop forever instead of single pass (env WATCH=1)",
+    )
+    p.add_argument("--dry-run", action="store_true", help="don't actually delete; just report")
+    p.add_argument("--exclude-guild", action="append", help="guild ID to skip (repeatable)")
+    p.add_argument("--exclude-channel", action="append", help="channel/DM ID to skip (repeatable)")
     p.set_defaults(func=cmd_run)
 
     return ap.parse_args()
@@ -742,8 +832,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if not args.token:
-        print("ERROR: no token. Set DISCORD_TOKEN env var or pass --token.",
-              file=sys.stderr)
+        print("ERROR: no token. Set DISCORD_TOKEN env var or pass --token.", file=sys.stderr)
         return 2
     return args.func(args)
 

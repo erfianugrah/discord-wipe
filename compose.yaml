@@ -8,9 +8,15 @@
 
 services:
   discord-wipe:
+    # Pulled by composer / docker compose pull. Override DISCORD_WIPE_TAG
+    # in .env to pin to a release tag (e.g. v1.2.3); default :main
+    # tracks the latest release.yml build off the main branch.
+    image: ghcr.io/erfianugrah/discord-wipe:${DISCORD_WIPE_TAG:-main}
+    # Build context is kept for local dev (./discord_wipe.py changes
+    # without a CI roundtrip). Compose only builds if the image isn't
+    # available locally and `docker compose up --build` is used.
     build:
       context: .
-    image: discord-wipe:local
     container_name: discord-wipe
     restart: unless-stopped
     env_file:

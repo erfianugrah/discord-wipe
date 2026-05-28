@@ -1,0 +1,42 @@
+# Keep the build context lean — image build copies just discord_wipe.py
+# but uploaded context size still affects build speed and cache.
+
+# VCS
+.git/
+.gitignore
+.github/
+.gitea/
+
+# Local agent / editor metadata
+.vscode/
+.idea/
+.DS_Store
+
+# Project docs (not needed in the image)
+README.md
+AGENTS.md
+docs/
+LICENSE
+
+# Local runtime state — must never leak into the image
+.env
+.env.*
+!.env.example
+state/
+state-*/
+export/
+
+# Python ephemera
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# CI artifacts
+*.log
+coverage/
+htmlcov/

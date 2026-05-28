@@ -1,0 +1,33 @@
+# Minimal pyproject.toml — used by ruff (lint+format) and python -m build
+# in CI. The script itself runs via uv-shebang or vanilla python; no
+# install step is required.
+
+[project]
+name = "discord-wipe"
+version = "0.2.0"
+description = "Rolling-retention bulk deleter for your own Discord messages."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Erfi Anugrah" }]
+dependencies = ["requests>=2.32,<3"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Conservative defaults — we're not enforcing pep8-ism for a single-file
+# script. Just catch real bugs: pyflakes (F), bugbear (B), isort (I),
+# simplify (SIM), unused noqa (RUF).
+select = ["E", "F", "B", "I", "SIM", "RUF", "W"]
+ignore = [
+    # Long lines are caller-formatted log strings; the formatter handles
+    # them where appropriate.
+    "E501",
+    # `try: ... except Exception: ...` is fine for best-effort parsing.
+    "BLE001",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["discord_wipe"]
