@@ -67,7 +67,7 @@ parks.
   [FATAL] DISCORD TOKEN REJECTED.
 
   reason: Discord rejected the token (401): {'message': '401: Unauthorized', 'code': 0}
-  token: MTc0OTM...gieQ (len=72)
+  token: AAAAAAAA...zzzz (len=72)
 
   Discord user tokens have NO refresh flow. Causes:
     - You logged out / logged back in (issues a new token).
@@ -126,7 +126,7 @@ parks.
 - The token is **never** committed to git. The `.gitignore` enforces
   this; `.env.example` only contains the placeholder `replace-me`.
 - The token is **never** logged. The daemon's logs only print a safe
-  fingerprint: `MTc0OTM...gieQ (len=72)` — first 6 + last 4 chars + length.
+  fingerprint: `AAAAAAAA...zzzz (len=72)` — first 6 + last 4 chars + length. Generic placeholders shown here; runtime logs use real chars (deliberately, so you can disambiguate between multiple expired tokens during a rotation).
 - The token is **never** in CI. GitHub Actions doesn't need it; only
   the running container does.
 - Long-term, consider storing it in Vaultwarden and pulling it onto

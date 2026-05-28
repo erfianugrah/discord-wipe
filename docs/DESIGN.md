@@ -110,20 +110,71 @@ just Phase 2.
 
 ## Rate-limit calibration
 
-Discord's documented per-route limits for `DELETE channel messages`
-are ~5/sec/channel-bucket. Our `DELETE_DELAY=1.0` keeps us at 1/sec
-globally — well under the per-channel limit, and conservative enough
-that the rolling per-account abuse-detector doesn't twitch.
+Two rate-limit systems matter and the script honours both:
 
-The `messages/search` endpoint has a separate, slower limit. We hit
-each scope once per `SEARCH_DELAY` (30s) so the per-route bucket
-never gets close to empty.
+### Per-route bucket (header-driven)
 
-On 429 we honor `retry_after` from the response body (or the
-`Retry-After` header) and back off. The default DELETE delay also
-auto-extends if a request returns `X-RateLimit-Remaining: 0` —
-meaning we just consumed the last token of the bucket — for the value
-of `X-RateLimit-Reset-After`.
+Discord publishes the per-bucket state on every response:
+
+| Header | Meaning |
+|---|---|
+| `X-RateLimit-Limit` | Max requests in the current window |
+| `X-RateLimit-Remaining` | Requests left in this window |
+| `X-RateLimit-Reset-After` | Seconds until the bucket refills |
+| `X-RateLimit-Bucket` | Opaque bucket id |
+
+Optimal pacing is `Reset-After / Remaining` — it spreads the remaining
+quota evenly through the window so no request is ever the one that
+tips us into 429. The script computes this on every 204 and returns
+it as the recommended sleep:
+
+```python
+if rem == 0 and reset > 0:
+    return "ok", reset                  # bucket empty: wait full window
+if rem > 0 and reset > 0:
+    return "ok", reset / rem            # spread the remaining quota
+return "ok", 0.0                        # no header guidance
+```
+
+### Account-level abuse heuristics (floor-driven)
+
+Discord has a SECOND rate-limiter that watches overall request
+frequency from an account, independent of per-route buckets. It
+flags *speed* much more than *volume* — a hot loop hitting the
+release/bucket boundary perfectly for hours is far more likely to
+trigger CAPTCHAs / temp-lockouts / token rotations than a leisurely
+1 req/sec sustained pace.
+
+`DELETE_DELAY` (default `1.0s`) is the safety floor for this. The
+final sleep is `max(DELETE_DELAY, header_pace)` — so when the bucket
+is loose, the floor wins; when the bucket is tight, the header wins.
+
+### 429 handling
+
+On 429 we honor `retry_after` from the response body (or
+`Retry-After` header) and back off. With proper header-driven
+pacing, 429s are rare in steady state — if they're sustained, the
+pacer is doing its job by absorbing them.
+
+Sub-1s 429-retry logs are suppressed (the pacer handles them and
+there's nothing to act on). `>=1s` retries and 5xx errors are still
+logged so persistent throttling is visible.
+
+### Search endpoint
+
+The `messages/search` endpoint has a separate, much slower limit.
+We hit each scope once per `SEARCH_DELAY` (30s) so the per-route
+bucket never gets close to empty. The 30s also gives Discord's
+search index time to refresh between pages — deleted messages won't
+disappear from search results immediately.
+
+### Empirical pace
+
+First live backfill saw header-driven pace settle at ~1.5–1.7s per
+delete (Discord's per-account bucket is tighter than the documented
+5/5s would suggest). ETA for 105K messages ended up ~48h, vs the
+~29h theoretical at 1.0s/delete. The pacer was correct — the docs
+were optimistic.
 
 ## State machine
 
@@ -139,16 +190,44 @@ of `X-RateLimit-Reset-After`.
 ```
 
 - `deleted` — every ID we've successfully DELETEd OR observed as
-  already-gone (404). De-dupes across crashes.
+  already-gone (404). De-dupes across crashes. Both phases
+  pre-filter this set BEFORE any API call:
+  - Export phase strips IDs from the per-channel `targets` list
+    (line ~475 in `discord_wipe.py`).
+  - Catchup phase skips on the inner delete loop (line ~646) and
+    counts only NEW hits in its no-progress guard (line ~634).
+  Zero wasted API calls on restart — visible in logs as
+  `N/N already done — skip` per channel.
 - `export_consumed` — Phase 1 runs once. Flipped at the end of the
-  first successful export pass. Dry-runs never flip this flag (this
-  was a bug discovered by the first end-to-end dry-run; see
-  `git log`).
-- `last_pass_at` — observability only.
-- `total_passes` — observability only.
+  first successful export pass. Dry-runs never flip this flag.
+- `last_pass_at` / `total_passes` — observability only.
 
-The file is saved atomically (`state.json.tmp` + `rename`) every 25
+The file is saved atomically (`state.json.tmp` + `rename`) every 10
 deletes within a pass, plus once after each scope, plus on `SIGTERM`.
+
+## Resume visibility
+
+When the script restarts mid-backfill, three log lines confirm the
+resume is real and no API calls are wasted:
+
+```
+[export] resume: 4521/105327 (4.3%) already done across 6/194
+         fully-done channels; 100806 targets remaining
+[export 1/194] DM         Direct Message with friend-a#0
+               9/9 already done — skip
+[export 5/194] DM         Direct Message with friend-b#0
+               2314 to delete (203/2517 already done)
+```
+
+- The `resume:` line comes from a one-time pre-scan that also
+  computes the ETA denominator — zero added cost.
+- `already done — skip` lines prove the per-channel skip is
+  happening before any HTTP.
+- The `(X/Y already done)` annotation on partial channels surfaces
+  the in-flight resume context.
+
+The pre-scan was added in 25d5197 — see commit message for the
+full rationale.
 
 ## What doesn't work
 

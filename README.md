@@ -23,10 +23,17 @@ restarts, and repeat passes never re-attempt the same ID.
 
 - **Export-driven first run is ~3× faster** than search-paginate. Search
   pages need a 30s wait between them so Discord's index can refresh;
-  with known IDs we skip that wait entirely. ~105K messages → ~29h via
-  export pass at the default 1s delete delay.
+  with known IDs we skip that wait entirely. ~105K messages → ~30-50h
+  depending on Discord's current per-account bucket tightness.
 - **`max_id` snowflake filter** does retention server-side. Recent
   messages are never returned, so we don't waste any calls on them.
+- **Header-driven pacing.** Discord publishes `X-RateLimit-Remaining` +
+  `Reset-After` on every response; the script paces evenly through the
+  remaining quota (`reset / remaining` per delete) and never tips into
+  429 territory. `DELETE_DELAY` is the safety floor, not the target.
+- **Resumable.** State file tracks every deleted ID. On restart the
+  script skips them all without any API call — visible per-channel in
+  the logs (e.g. `15/15 already done — skip`).
 - **Single command, one mode**: every pass deletes "everything older
   than the cutoff". Backfill and steady-state are the same code path —
   the first pass just happens to find a lot more.
@@ -35,21 +42,37 @@ restarts, and repeat passes never re-attempt the same ID.
 
 ```
 discord-wipe/
-├── discord_wipe.py     # the script (single-file, stdlib + requests)
-├── Dockerfile          # python:3.12-slim + requests
-├── compose.yaml        # the stack definition
-├── .env.example        # copy to .env, fill in DISCORD_TOKEN
-├── .gitignore          # blocks .env / state/ / export/
-└── README.md           # this file
+├── discord_wipe.py            single-file script (stdlib + requests)
+├── Dockerfile                 python:3.12-slim, non-root, PUID=99/PGID=100
+├── compose.yaml               the stack (pulls ghcr.io/erfianugrah/discord-wipe)
+├── .env.example               token template
+├── .gitignore                 blocks .env / state/ / export/
+├── .dockerignore              keeps the image build context lean
+├── pyproject.toml             ruff config + project metadata
+├── AGENTS.md                  agent-facing project conventions
+├── README.md                  this file
+├── LICENSE                    MIT
+├── docs/
+│   ├── DESIGN.md              design rationale + alternatives considered
+│   ├── OPERATIONS.md          deploy / monitor / debug / rotate
+│   └── TOKEN.md               token lifecycle (no refresh; rotation procedure)
+└── .github/workflows/
+    ├── ci.yml                 ruff + py_compile + docker build smoke
+    └── release.yml            multi-arch ghcr.io image build on main + tags
 ```
 
-At runtime (on servarr), the project lives at
-`/mnt/user/appdata/discord-wipe/` and gets two extra dirs:
+**Bind-mount paths** are configurable via `DISCORD_WIPE_DATA_DIR`
+(default `/mnt/user/discord-wipe`). At runtime that holds:
 
 ```
-├── export/Messages/    # bind-mounted RO from your data export ZIP
-└── state/state.json    # bind-mounted RW; resume state
+/mnt/user/discord-wipe/
+├── export/Messages/    bind-mounted RO from your data export ZIP
+└── state/state.json    bind-mounted RW; resume state
 ```
+
+The stack itself lives at `/mnt/user/composer/stacks/discord-wipe/`
+when managed by Composer (the user's GitOps platform), or wherever you
+`git clone` it standalone.
 
 ## Get your Discord data export
 
@@ -88,25 +111,68 @@ export DISCORD_TOKEN='your-token-here'
    --retention-days 7
 ```
 
-## Deploy on servarr
+## Deploy
+
+### Via Composer (GitOps)
+
+The production path. Composer at `composer.erfi.io` watches `main`
+and auto-redeploys on every push:
 
 ```bash
-# 1. Copy the project + export across.
-rsync -av --exclude=.env --exclude=state ~/discord-wipe/ \
-    servarr:/mnt/user/appdata/discord-wipe/
-rsync -av ~/erfi-bot/data/exports/discord/package/Messages/ \
-    servarr:/mnt/user/appdata/discord-wipe/export/Messages/
+export COMPOSER_API_KEY=...   # from Bitwarden
+export BASE=https://composer.erfi.io/api/v1
 
-# 2. Drop the token in .env on servarr (chmod 600).
-ssh servarr 'umask 077 && cat > /mnt/user/appdata/discord-wipe/.env' <<EOF
+# One-time: register the stack.
+curl -sf -X POST -H "X-API-Key: $COMPOSER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "discord-wipe",
+    "repo_url": "git@github.com:erfianugrah/discord-wipe.git",
+    "branch": "main",
+    "compose_path": "compose.yaml",
+    "env_path": ".env",
+    "auth_method": "none"
+  }' "$BASE/stacks/git"
+
+# One-time: drop the token + sync the export. (.env must be chmod 600
+# and owned by nobody:users for composer's container to read it.)
+ssh servarr 'umask 077 && cat > /mnt/user/composer/stacks/discord-wipe/.env <<EOF
 DISCORD_TOKEN=your-token-here
+DISCORD_WIPE_TAG=main
+TZ=Europe/Amsterdam
 EOF
+chown nobody:users /mnt/user/composer/stacks/discord-wipe/.env'
 
-# 3. Build + start.
-ssh servarr 'cd /mnt/user/appdata/discord-wipe && docker compose up -d --build'
+ssh servarr 'mkdir -p /mnt/user/discord-wipe/{export,state} && \
+  chown -R 99:100 /mnt/user/discord-wipe'
+rsync -a ~/erfi-bot/data/exports/discord/package/Messages/ \
+    servarr:/mnt/user/discord-wipe/export/Messages/
 
-# 4. Watch it work.
-ssh servarr 'docker logs -f discord-wipe'
+# Bring up.
+curl -sf -X POST -H "X-API-Key: $COMPOSER_API_KEY" \
+    "$BASE/stacks/discord-wipe/up?async=true"
+```
+
+After that, every `git push origin main` triggers the
+`release.yml` workflow on GitHub Actions → image goes to
+`ghcr.io/erfianugrah/discord-wipe:main` → Composer's webhook pulls
+and redeploys.
+
+### Standalone (no Composer)
+
+```bash
+git clone git@github.com:erfianugrah/discord-wipe.git
+cd discord-wipe
+
+echo "DISCORD_TOKEN=your-token-here" > .env
+chmod 600 .env
+
+mkdir -p /mnt/user/discord-wipe/{export,state}
+rsync -a ~/erfi-bot/data/exports/discord/package/Messages/ \
+    /mnt/user/discord-wipe/export/Messages/
+
+docker compose pull && docker compose up -d
+docker logs -f discord-wipe
 ```
 
 ## Operator runbook
@@ -120,24 +186,30 @@ ssh servarr 'docker logs -f discord-wipe'
 | Force re-run export phase | stop, edit `state/state.json`, set `"export_consumed": false`, start |
 | Skip a guild/DM | edit compose.yaml `command:` to add `--exclude-guild ID` or `--exclude-channel ID`, `docker compose up -d` |
 | Tighten/loosen retention | bump `RETENTION_DAYS` in compose.yaml, `docker compose up -d` |
-| Bump speed | drop `DELETE_DELAY` toward 0.3s. Stop tightening when 429s appear. |
-| Filter logs | `docker logs discord-wipe 2>&1 \| rg -i 'error\|429\|forbidden\|unexpected'` |
+| Bump speed | drop `DELETE_DELAY` toward 0.3s. Header-driven pacer handles per-bucket throttling automatically; the floor mostly defends against account-level abuse heuristics. |
+| Filter logs | `docker logs discord-wipe 2>&1 \| rg -i 'error\|429\|forbidden\|fatal\|terminal 400'` |
+| Pin a specific build | edit `.env` on servarr, set `DISCORD_WIPE_TAG=v1.2.3` (or any `sha-<short>`), `docker compose up -d` |
 
 ## Failure modes / rate limits
 
 - **HTTP 429** — handled. Script reads `retry_after` from the body (or
-  `Retry-After` header) and sleeps. Persistent 429s mean either you're
-  too fast (raise `DELETE_DELAY`) or Discord has flagged the account
-  for inspection (back off, run dry-run, wait a day before trying
-  again).
+  `Retry-After` header) and sleeps. Header-driven pacing means routine
+  429s are now rare; if they're sustained, Discord has tightened the
+  per-account bucket and the pacer is doing its job by absorbing them.
+  Persistent multi-second `Retry-After` values mean the account has
+  been flagged — stop, wait a day, restart.
+- **HTTP 400 with a Discord code** — semantic error, terminal.
+  Documented codes the script treats as `forbidden`:
+  `50083` (thread archived), `50001` (missing access),
+  `50021` (system message), `50034` (message too old),
+  `160005` (thread locked). Logged once each, marked done, skipped.
 - **HTTP 403** — message is not yours or is a system message
   (call/pin/join). Counted as `forbidden`, marked done, moves on.
 - **HTTP 404** — already deleted by you elsewhere or by Discord.
   Counted as `gone`, treated as success.
-- **Token rotation** — if you log out / change password, the token
-  invalidates. Re-grab it from DevTools, edit `.env`, restart the
-  container. The daemon needs a token that stays valid for the
-  duration of the wipe.
+- **HTTP 401** — token rotated by Discord. The daemon prints a FATAL
+  banner with rotation steps and parks itself (no restart-loop
+  hammering the API). See `docs/TOKEN.md` for the full procedure.
 - **Discord API changes** — the search endpoint occasionally moves
   fields around. If you start seeing `unexpected 4xx` logs, check
   upstream tools (victornpb/undiscord, OrbitalCheese/undiscord-lite)
@@ -154,6 +226,38 @@ tune the delays toward zero.
 You can only delete your own messages; this is an API-level
 restriction, not a script limitation.
 
+## What gets logged (and why)
+
+Every pass writes a progress line every 10 deletes:
+
+```
+[export] resume: 4521/105327 (4.3%) already done across 6/194 fully-done channels; 100806 targets remaining
+[export 5/194] DM         Direct Message with friend-a#0                    2314 to delete (203/2517 already done)
+    10/2314 ok=10 gone=0 403=0 | total: 4531/105327 (4.3%) ~36/min ETA 48h59m
+```
+
+- `resume:` line shows what was already done before this pass started —
+  so the resume is auditable.
+- `already done — skip` lines confirm that channels with all-deleted
+  messages were skipped without any API calls.
+- The per-channel `N/M` counter and the grand-total `X/Y (Z%) ETA` are
+  printed together so you always know both the channel progress and
+  the overall progress.
+- Sub-1s rate-limit retries are suppressed by design — the
+  header-driven pacer is absorbing them and there's nothing to act on.
+  `>=1s` retries and 5xx errors are still logged.
+
+## Documentation
+
+- [`AGENTS.md`](AGENTS.md) — conventions for AI agents working in this
+  repo (safety rules, architecture, tool routing).
+- [`docs/DESIGN.md`](docs/DESIGN.md) — why the script looks the way it
+  does. Alternatives considered, rate-limit calibration, state machine.
+- [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — deploy, monitor, debug,
+  rotate, backup, remove. Composer wiring details.
+- [`docs/TOKEN.md`](docs/TOKEN.md) — token lifecycle. Why there's no
+  refresh flow, what invalidates a token, how to rotate cleanly.
+
 ## License
 
-Personal tool. Do whatever you want with it.
+[MIT](LICENSE). Personal tool. Do whatever you want with it.
