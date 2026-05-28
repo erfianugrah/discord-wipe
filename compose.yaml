@@ -29,8 +29,13 @@ services:
       WATCH: "1"
       TZ: "Europe/Amsterdam"
     volumes:
-      - ./export:/data/export:ro
-      - ./state:/data/state
+      # ABSOLUTE host paths — composer-managed stacks run via a daemon
+      # inside a container, so relative `./` paths resolve to the
+      # composer container's view (not the host) and silently miss.
+      # Override with DISCORD_WIPE_DATA_DIR to relocate. Default follows
+      # the user's per-stack convention (`/mnt/user/<stack>/`).
+      - ${DISCORD_WIPE_DATA_DIR:-/mnt/user/discord-wipe}/export:/data/export:ro
+      - ${DISCORD_WIPE_DATA_DIR:-/mnt/user/discord-wipe}/state:/data/state
     # No inbound network. Default bridge with outbound-only is plenty.
     # Resource caps so a runaway loop can't eat the host.
     deploy:
