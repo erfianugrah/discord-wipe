@@ -396,6 +396,10 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
                 break
             if cfg.dry_run:
                 counters["ok"] += 1
+                # Mark even in dry-run so the catchup phase doesn't
+                # double-count the same IDs. Real-run state hygiene is
+                # protected by the separate-state-file convention.
+                cfg.state.mark(mid)
                 continue
 
             extra_sleep = 0.0
@@ -430,9 +434,13 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
 
         cfg.state.save()
 
-    if not STOP:
+    if not STOP and not cfg.dry_run:
+        # In dry-run we never want to flip this flag — a subsequent
+        # real run on the same state file MUST still process the
+        # export. (Convention is to use a separate state file for dry
+        # runs, but belt-and-braces.)
         cfg.state.export_consumed = True
-        cfg.state.save()
+    cfg.state.save()
     print(f"[export] done: {counters}")
 
 
@@ -495,7 +503,22 @@ def phase_live_catchup(s: requests.Session, cfg: WipeConfig) -> None:
                 continue
             empty_streak = 0
 
-            print(f"  page: {len(hits)} hits (search reports total={total})")
+            # No-progress guard. Real deletes remove items from search
+            # so a fresh query returns new hits; dry-run leaves them in
+            # place, and a stale search index can also re-serve already
+            # deleted IDs. If every hit on this page is already marked,
+            # the scope is effectively done.
+            new_in_page = sum(
+                1 for m in hits if str(m["id"]) not in cfg.state.deleted
+            )
+            if new_in_page == 0:
+                print(f"  page: {len(hits)} hits, all already done; scope finished")
+                break
+
+            print(
+                f"  page: {len(hits)} hits ({new_in_page} new, "
+                f"search reports total={total})"
+            )
 
             # Hits are author-filtered + max_id-bounded server-side.
             for m in hits:
