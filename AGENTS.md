@@ -13,7 +13,7 @@ older than `RETENTION_DAYS` (default 7). One file of Python (stdlib +
 Stack files live at `/mnt/user/composer/stacks/discord-wipe/` on `servarr`
 (composer-managed git clone); data (export RO, state RW) lives at
 `/mnt/user/discord-wipe/`. Image is published to `ghcr.io/erfianugrah/discord-wipe`.
-Current version: see `__version__` in `discord_wipe.py` (0.3.1 as of this commit).
+Current version: see `__version__` in `discord_wipe.py` (0.4.0 as of this commit).
 
 ## Hard safety rules (read these or break things)
 
@@ -77,6 +77,18 @@ skip` lines. Pacing is header-driven: `max(DELETE_DELAY, Reset-After /
 Remaining)`, so 429s are rare in steady state and ETA adapts to
 whatever Discord's bucket is currently advertising.
 
+v0.4.0 added five resilience + observability layers without changing
+the core flow: (a) a per-save heartbeat file feeds a docker
+HEALTHCHECK so composer's dashboard shows real liveness; (b) a
+`StateUnwritableError` park path catches FS-full / mount-frozen /
+perms-wrong instead of crashing into a restart loop; (c) a
+restart-burst counter persisted in `state.json` parks the daemon if
+it's been restarted >5 times in <10 minutes (broken `:main` image
+guard); (d) a Prometheus `/metrics` endpoint on :9090 (localhost-mapped
+by compose); (e) an opt-in `NTFY_URL` webhook that fires on every
+park event. None of these touch the delete pipeline; all are
+bypassable via env vars.
+
 ## Repo layout
 
 ```
@@ -92,10 +104,13 @@ discord-wipe/
 ├── pyproject.toml         ruff config + project metadata
 ├── tests/
 │   ├── __init__.py
-│   └── test_discord_wipe.py  stdlib unittest, 13 tests: 3 safety mandate
-│                             (only-my-messages defence-in-depth) + 8 regression
-│                             (one per fixed bug) + 2 anti-GC guards (the v0.3.0
-│                             footgun stays buried)
+│   └── test_discord_wipe.py  stdlib unittest, 33 tests across 14 classes:
+│                             3 safety mandate (only-my-messages defence-
+│                             in-depth) + 11 regression (one per fixed bug,
+│                             plus the v0.3.0 anti-GC guards) + 16 v0.4.0
+│                             feature tests (heartbeat, restart-burst,
+│                             state-unwritable, notify-on-park, metrics,
+│                             status subcommand)
 ├── docs/
 │   ├── DESIGN.md          design rationale + alternatives considered
 │   ├── OPERATIONS.md      runbook (deploy, rotate, debug, backfill, recovery)

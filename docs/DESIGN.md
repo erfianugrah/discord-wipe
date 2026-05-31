@@ -316,6 +316,55 @@ resume is real and no API calls are wasted:
 The pre-scan was added in 25d5197 — see commit message for the
 full rationale.
 
+## v0.4.0 resilience + observability layer
+
+Five additions on top of the v0.3.x core (none of them touch the
+delete pipeline; all bypassable via env vars):
+
+- **Heartbeat file** at `/data/state/heartbeat`. Touched on every
+  `state.save()` during a pass + every 60s during the long
+  inter-pass sleep. Three consumers: docker HEALTHCHECK, the
+  `status` subcommand, and the operator's `ls -la` eyeball.
+
+- **Docker HEALTHCHECK** reads the heartbeat mtime; marks the
+  container unhealthy if older than 25h (covers a full
+  INTERVAL_HOURS=24 sleep + buffer). Composer dashboards and
+  `docker ps` reflect actual liveness, not just "process exists".
+
+- **`StateUnwritableError` park path.** When `state.save()` raises
+  `OSError` (FS full, mount frozen, perms wrong, bind-mount
+  missing), the daemon calls `_state_unwritable_exit` and parks
+  indefinitely. Without this guard the script would crash on every
+  pass and `restart: unless-stopped` would respawn it into a hot
+  loop. The 2026-05-24 servarr SATA-controller incident motivated
+  this — prior versions would've spammed Discord during the FS
+  freeze window.
+
+- **Restart-burst guard.** `State.record_start()` tracks consecutive
+  starts; if >5 within 600s, `_restart_burst_exit` parks. State is
+  persisted in `state.json` (`last_started_at`, `restart_burst`)
+  so the counter survives the restarts themselves. Defends against
+  a broken `:main` image, missing token, or any crash-on-startup.
+
+- **Prometheus `/metrics`** endpoint on port 9090 (localhost-mapped
+  by compose). Stdlib `http.server` in a daemon thread; <100 lines.
+  Series: deletes_total (counter), state_deleted_count (gauge),
+  export_consumed (gauge), parked (gauge), extra_sleep_seconds
+  (gauge, per phase — surfaces the current pacing floor),
+  last_pass_{start,end}_seconds (gauge).
+
+- **Notify-on-park webhook.** `NTFY_URL` env var (opt-in). On any
+  park event (401 / identity-change / state-unwritable /
+  restart-burst), POST the FATAL banner to that URL with the reason
+  in the `Title` header. ntfy.sh-compatible. Best-effort — a
+  failed POST is logged and swallowed; never propagates.
+
+Shared base: `_park_until_sigterm(banner, reason)` is the single
+function every park path calls. It prints the banner, flags
+`METRICS.parked = True`, fires the notify webhook, and sleeps in 5s
+chunks until SIGTERM. Returns 0 so docker treats the exit as clean
+and `restart: unless-stopped` does NOT respawn us.
+
 ## What doesn't work
 
 - **Reactions.** The script doesn't remove your reactions on other

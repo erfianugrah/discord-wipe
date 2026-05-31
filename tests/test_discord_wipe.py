@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -669,6 +670,257 @@ class Bug9_PacingPersistsAcrossMessagesAndRefreshesFrom404And429(unittest.TestCa
         status, hint = dw.delete_message(sess, "c1", "m1")
         self.assertEqual(status, "gone")
         self.assertEqual(hint, 2.0)  # 10/5
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0: heartbeat, restart-burst guard, metrics, status, notify-on-park,
+# state-unwritable handling.
+# ---------------------------------------------------------------------------
+
+
+class V040_HeartbeatWrittenOnSave(unittest.TestCase):
+    def test_state_save_touches_heartbeat_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            state = dw.State(tmp / "state.json")
+            state.mark("123")
+            state.save()
+            hb = tmp / "heartbeat"
+            self.assertTrue(hb.exists(), "heartbeat file should be written by save()")
+
+    def test_touch_heartbeat_is_idempotent_and_safe(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            state = dw.State(tmp / "state.json")
+            state.touch_heartbeat()
+            state.touch_heartbeat()  # second call must not raise
+            self.assertTrue((tmp / "heartbeat").exists())
+
+
+class V040_RestartBurstGuard(unittest.TestCase):
+    def test_consecutive_starts_within_window_increment_counter(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            state = dw.State(tmp / "state.json")
+            now = datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc)
+            state.record_start(now=now)
+            state.record_start(now=now + timedelta(seconds=30))
+            state.record_start(now=now + timedelta(seconds=120))
+            self.assertEqual(state.restart_burst, 3)
+
+    def test_start_outside_window_resets_counter(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            state = dw.State(tmp / "state.json")
+            now = datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc)
+            state.record_start(now=now)
+            state.record_start(now=now + timedelta(seconds=30))
+            # Outside RESTART_BURST_WINDOW (600s default).
+            state.record_start(now=now + timedelta(seconds=900))
+            self.assertEqual(state.restart_burst, 1)
+
+    def test_restart_burst_survives_save_load_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            sp = tmp / "state.json"
+            state = dw.State(sp)
+            state.record_start()
+            state.restart_burst = 4
+            state.save()
+            # Reload and verify it persists.
+            reloaded = dw.State(sp)
+            self.assertEqual(reloaded.restart_burst, 4)
+            self.assertEqual(reloaded.last_started_at, state.last_started_at)
+
+
+class V040_StateUnwritableRaisesNotCrashes(unittest.TestCase):
+    def test_state_init_raises_on_unwritable_parent(self):
+        # Try to make state in a parent path that exists as a FILE (so
+        # mkdir(parents=True) fails). Avoids root + chmod tricks.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            blocker = tmp / "blocker"
+            blocker.write_text("i am a file")
+            with self.assertRaises(dw.StateUnwritableError):
+                dw.State(blocker / "state.json")
+
+    def test_state_save_raises_on_unwritable_dir(self):
+        import shutil
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            state = dw.State(tmp / "state.json")
+            # After init, nuke the parent dir so save() can't write.
+            shutil.rmtree(tmp)
+            with self.assertRaises(dw.StateUnwritableError):
+                state.save()
+
+
+class V040_CmdRunParksOnStateUnwritable(unittest.TestCase):
+    def test_cmd_run_parks_when_state_dir_blocks_init(self):
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            blocker = tmp / "blocker"
+            blocker.write_text("i am a file")
+            args = argparse.Namespace(
+                cmd="run",
+                token="fake",
+                state=blocker / "state.json",
+                export_dir=tmp / "no-export",
+                retention_days=7.0,
+                delete_delay=0.0,
+                search_delay=0.0,
+                interval_hours=24.0,
+                watch=False,
+                dry_run=True,
+                exclude_guild=[],
+                exclude_channel=[],
+            )
+
+            def sleep_then_stop(*_a, **_kw):
+                dw.STOP = True
+
+            with mock.patch.object(dw.time, "sleep", side_effect=sleep_then_stop):
+                rc = dw.cmd_run(args)
+            self.assertEqual(rc, 0)  # paused exit returns 0
+
+
+class V040_CmdRunParksOnRestartBurst(unittest.TestCase):
+    def test_cmd_run_parks_after_too_many_quick_restarts(self):
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            # Pre-populate state.json with restart_burst already at MAX.
+            sp = tmp / "state.json"
+            now = datetime.now(timezone.utc)
+            sp.write_text(
+                json.dumps(
+                    {
+                        "deleted": [],
+                        "export_consumed": False,
+                        "last_pass_at": None,
+                        "last_started_at": now.isoformat(),
+                        "restart_burst": dw.RESTART_BURST_MAX,
+                    }
+                )
+            )
+            args = argparse.Namespace(
+                cmd="run",
+                token="fake",
+                state=sp,
+                export_dir=tmp / "no-export",
+                retention_days=7.0,
+                delete_delay=0.0,
+                search_delay=0.0,
+                interval_hours=24.0,
+                watch=False,
+                dry_run=True,
+                exclude_guild=[],
+                exclude_channel=[],
+            )
+
+            def sleep_then_stop(*_a, **_kw):
+                dw.STOP = True
+
+            # The next start bumps burst to MAX+1 → park.
+            with (
+                mock.patch.object(dw, "get_me", return_value={"id": "x", "username": "x"}),
+                mock.patch.object(dw.time, "sleep", side_effect=sleep_then_stop),
+            ):
+                rc = dw.cmd_run(args)
+            self.assertEqual(rc, 0)
+
+
+class V040_NotifyOnParkBestEffort(unittest.TestCase):
+    def test_notify_park_posts_to_configured_url(self):
+        with (
+            mock.patch.object(dw, "NTFY_URL", "https://ntfy.example/test"),
+            mock.patch.object(dw.requests, "post") as p,
+        ):
+            dw._notify_park("test-reason", "banner body")
+        self.assertEqual(p.call_count, 1)
+        args, kwargs = p.call_args
+        self.assertEqual(args[0], "https://ntfy.example/test")
+        self.assertEqual(kwargs["data"], b"banner body")
+        self.assertIn("Title", kwargs["headers"])
+
+    def test_notify_park_silent_when_not_configured(self):
+        with (
+            mock.patch.object(dw, "NTFY_URL", ""),
+            mock.patch.object(dw.requests, "post") as p,
+        ):
+            dw._notify_park("test-reason", "banner body")
+        self.assertEqual(p.call_count, 0)
+
+    def test_notify_park_swallows_post_errors(self):
+        with (
+            mock.patch.object(dw, "NTFY_URL", "https://ntfy.example/test"),
+            mock.patch.object(dw.requests, "post", side_effect=RuntimeError("net down")),
+        ):
+            # Must not raise.
+            dw._notify_park("test-reason", "banner body")
+
+
+class V040_MetricsExposition(unittest.TestCase):
+    def test_format_prom_emits_required_series(self):
+        m = dw.Metrics()
+        m.deletes["ok"] = 100
+        m.deletes["gone"] = 50
+        m.deletes["forbidden"] = 3
+        m.parked = True
+        body = m.format_prom()
+        self.assertIn("# TYPE discord_wipe_deletes_total counter", body)
+        self.assertIn('discord_wipe_deletes_total{outcome="ok"} 100', body)
+        self.assertIn('discord_wipe_deletes_total{outcome="gone"} 50', body)
+        self.assertIn('discord_wipe_deletes_total{outcome="forbidden"} 3', body)
+        self.assertIn("discord_wipe_parked 1", body)
+
+    def test_format_prom_handles_no_state_attached(self):
+        m = dw.Metrics()
+        body = m.format_prom()  # must not raise
+        self.assertIn("discord_wipe_state_deleted_count 0", body)
+
+
+class V040_StatusSubcommandWorks(unittest.TestCase):
+    def test_status_subcommand_prints_state_summary(self):
+        import io
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            sp = tmp / "state.json"
+            sp.write_text(
+                json.dumps(
+                    {
+                        "deleted": ["id-1", "id-2", "id-3"],
+                        "export_consumed": True,
+                        "last_pass_at": "2026-05-28T12:00:00+00:00",
+                        "last_started_at": "2026-05-28T11:55:00+00:00",
+                        "restart_burst": 2,
+                    }
+                )
+            )
+            args = argparse.Namespace(state=sp)
+            buf = io.StringIO()
+            with mock.patch.object(sys, "stdout", buf):
+                rc = dw.cmd_status(args)
+            out = buf.getvalue()
+            self.assertEqual(rc, 0)
+            self.assertIn("deleted IDs:", out)
+            self.assertIn("3", out)
+            self.assertIn("export consumed:  True", out)
+            self.assertIn("restart_burst:    2", out)
+
+    def test_status_handles_missing_state_file(self):
+        import io
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = argparse.Namespace(state=pathlib.Path(tmpdir) / "missing.json")
+            buf = io.StringIO()
+            with mock.patch.object(sys, "stdout", buf):
+                rc = dw.cmd_status(args)
+            self.assertEqual(rc, 1)
+            self.assertIn("no state file", buf.getvalue())
 
 
 if __name__ == "__main__":

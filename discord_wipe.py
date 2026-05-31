@@ -39,13 +39,16 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import http.server
 import json
 import os
 import pathlib
 import signal
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -55,7 +58,7 @@ import requests
 # Constants
 # ---------------------------------------------------------------------------
 
-__version__ = "0.3.3"  # bump on every behaviour change; tag releases as vX.Y.Z
+__version__ = "0.4.0"  # bump on every behaviour change; tag releases as vX.Y.Z
 
 API = "https://discord.com/api/v10"
 DISCORD_EPOCH_MS = 1420070400000  # 2015-01-01T00:00:00Z
@@ -69,6 +72,23 @@ USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+
+# Restart-burst guard (v0.4.0+). If cmd_run starts >RESTART_BURST_MAX times
+# within RESTART_BURST_WINDOW seconds, park instead of letting docker's
+# `restart: unless-stopped` spin us forever against Discord.
+RESTART_BURST_MAX = 5
+RESTART_BURST_WINDOW = 600  # 10 minutes
+
+# Metrics server bind (v0.4.0+). Default 0.0.0.0:9090 inside the container;
+# compose maps it to 127.0.0.1:9090 on the host so only same-host scrapers
+# (Prometheus on the homelab) can reach it.
+METRICS_BIND = os.environ.get("METRICS_BIND", "0.0.0.0:9090")
+METRICS_ENABLED = os.environ.get("METRICS_ENABLED", "1").lower() in {"1", "true", "yes"}
+
+# Notify-on-park (v0.4.0+). If set, POST a notification to this URL on
+# every park event (401, identity-change, state-unwritable, restart-burst).
+# ntfy.sh-compatible: bare URL like https://ntfy.sh/<topic> works.
+NTFY_URL = os.environ.get("NTFY_URL", "").strip()
 
 # ---------------------------------------------------------------------------
 # Stop flag for clean shutdown on SIGINT / SIGTERM
@@ -117,14 +137,28 @@ def snowflake_to_dt(sf: int) -> datetime:
 
 
 class State:
-    """JSON-on-disk state. Tracks deleted IDs + export-consumed flag."""
+    """JSON-on-disk state. Tracks deleted IDs + export-consumed flag
+    + restart-burst counters (v0.4.0+)."""
 
     def __init__(self, path: pathlib.Path):
         self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise StateUnwritableError(
+                f"state directory {self.path.parent} is unwritable: {e}"
+            ) from e
         self.deleted: set[str] = set()
         self.export_consumed: bool = False
         self.last_pass_at: Optional[str] = None
+        # Restart-burst guard (v0.4.0+). If the container crashes >5 times
+        # within RESTART_BURST_WINDOW seconds, park instead of letting
+        # docker keep restarting us into a hot loop against Discord.
+        self.last_started_at: Optional[str] = None
+        self.restart_burst: int = 0
+        # Heartbeat path (next to state.json, also in the bind-mount).
+        # HEALTHCHECK reads its mtime; state.save() touches it.
+        self.heartbeat_path = self.path.with_name("heartbeat")
         self._load()
 
     def _load(self) -> None:
@@ -157,19 +191,59 @@ class State:
         self.deleted = set(d.get("deleted", []))
         self.export_consumed = bool(d.get("export_consumed", False))
         self.last_pass_at = d.get("last_pass_at")
+        self.last_started_at = d.get("last_started_at")
+        self.restart_burst = int(d.get("restart_burst", 0) or 0)
 
     def save(self) -> None:
         tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(
-                {
-                    "deleted": sorted(self.deleted),
-                    "export_consumed": self.export_consumed,
-                    "last_pass_at": self.last_pass_at,
-                }
+        try:
+            tmp.write_text(
+                json.dumps(
+                    {
+                        "deleted": sorted(self.deleted),
+                        "export_consumed": self.export_consumed,
+                        "last_pass_at": self.last_pass_at,
+                        "last_started_at": self.last_started_at,
+                        "restart_burst": self.restart_burst,
+                    }
+                )
             )
-        )
-        tmp.replace(self.path)
+            tmp.replace(self.path)
+        except OSError as e:
+            raise StateUnwritableError(f"could not write state file {self.path}: {e}") from e
+        # Heartbeat: a separate file whose mtime is what the HEALTHCHECK
+        # inspects. Best-effort — if it fails we don't crash the save.
+        with contextlib.suppress(OSError):
+            self.heartbeat_path.write_text(self.last_pass_at or "")
+
+    def touch_heartbeat(self) -> None:
+        """Bump heartbeat mtime without rewriting state.json. Called from
+        the long sleep loop between passes so HEALTHCHECK stays green."""
+        with contextlib.suppress(OSError):
+            self.heartbeat_path.touch(exist_ok=True)
+
+    def record_start(self, now: Optional[datetime] = None) -> None:
+        """Update last_started_at + restart_burst on cmd_run startup.
+
+        If we started <RESTART_BURST_WINDOW seconds ago, increment the
+        burst counter; else reset to 1. The caller checks the counter
+        afterwards and parks if it exceeds the threshold.
+        """
+        if now is None:
+            now = datetime.now(timezone.utc)
+        prev_iso = self.last_started_at
+        if prev_iso:
+            try:
+                prev = datetime.fromisoformat(prev_iso)
+                if (now - prev).total_seconds() < RESTART_BURST_WINDOW:
+                    self.restart_burst += 1
+                else:
+                    self.restart_burst = 1
+            except ValueError:
+                self.restart_burst = 1
+        else:
+            self.restart_burst = 1
+        self.last_started_at = now.isoformat()
 
     def mark(self, msg_id: str) -> None:
         self.deleted.add(str(msg_id))
@@ -193,6 +267,145 @@ class State:
 
 
 # ---------------------------------------------------------------------------
+# Metrics (Prometheus exposition format, stdlib http.server)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Metrics:
+    """Prometheus-format metrics exposed on /metrics. Thread-safe enough
+    for our use (CPython dict updates are atomic under the GIL).
+
+    Created at process start; counters incremented inline by the delete
+    loops; gauges refreshed on demand from the live State.
+    """
+
+    deletes: dict[str, int] = field(default_factory=lambda: {"ok": 0, "gone": 0, "forbidden": 0})
+    state: Optional["State"] = None
+    parked: bool = False
+    park_reason: str = ""
+    last_pass_start: Optional[float] = None
+    last_pass_end: Optional[float] = None
+    extra_sleep_export: float = 0.0
+    extra_sleep_catchup: float = 0.0
+
+    def inc(self, outcome: str) -> None:
+        self.deletes[outcome] = self.deletes.get(outcome, 0) + 1
+
+    def format_prom(self) -> str:
+        lines: list[str] = []
+        lines.append("# HELP discord_wipe_deletes_total Delete operations by outcome")
+        lines.append("# TYPE discord_wipe_deletes_total counter")
+        for outcome, n in self.deletes.items():
+            lines.append(f'discord_wipe_deletes_total{{outcome="{outcome}"}} {n}')
+
+        lines.append("# HELP discord_wipe_state_deleted_count IDs tracked in state.deleted")
+        lines.append("# TYPE discord_wipe_state_deleted_count gauge")
+        n_deleted = len(self.state.deleted) if self.state else 0
+        lines.append(f"discord_wipe_state_deleted_count {n_deleted}")
+
+        lines.append("# HELP discord_wipe_export_consumed 1 if export phase has run successfully")
+        lines.append("# TYPE discord_wipe_export_consumed gauge")
+        consumed = 1 if (self.state and self.state.export_consumed) else 0
+        lines.append(f"discord_wipe_export_consumed {consumed}")
+
+        lines.append("# HELP discord_wipe_parked 1 if daemon is parked (401, identity, state)")
+        lines.append("# TYPE discord_wipe_parked gauge")
+        lines.append(f"discord_wipe_parked {1 if self.parked else 0}")
+
+        if self.last_pass_start:
+            lines.append("# HELP discord_wipe_last_pass_start_seconds Unix ts of last pass start")
+            lines.append("# TYPE discord_wipe_last_pass_start_seconds gauge")
+            lines.append(f"discord_wipe_last_pass_start_seconds {self.last_pass_start:.0f}")
+        if self.last_pass_end:
+            lines.append("# HELP discord_wipe_last_pass_end_seconds Unix ts of last pass end")
+            lines.append("# TYPE discord_wipe_last_pass_end_seconds gauge")
+            lines.append(f"discord_wipe_last_pass_end_seconds {self.last_pass_end:.0f}")
+
+        lines.append("# HELP discord_wipe_extra_sleep_seconds Current pacing floor in each phase")
+        lines.append("# TYPE discord_wipe_extra_sleep_seconds gauge")
+        lines.append(
+            f'discord_wipe_extra_sleep_seconds{{phase="export"}} {self.extra_sleep_export:.3f}'
+        )
+        lines.append(
+            f'discord_wipe_extra_sleep_seconds{{phase="catchup"}} {self.extra_sleep_catchup:.3f}'
+        )
+
+        return "\n".join(lines) + "\n"
+
+
+METRICS = Metrics()
+
+
+def _start_metrics_server(metrics: Metrics, bind: str) -> Optional[http.server.HTTPServer]:
+    """Spawn a daemon thread serving /metrics. Returns the server (so the
+    caller can shutdown), or None if binding failed (port in use, etc)."""
+    host, _, port_s = bind.rpartition(":")
+    if not host:
+        host = "0.0.0.0"
+    try:
+        port = int(port_s)
+    except ValueError:
+        print(f"[metrics] invalid bind {bind!r}; disabled", file=sys.stderr)
+        return None
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/metrics":
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = metrics.format_prom().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):  # silence the default access log
+            return
+
+    try:
+        httpd = http.server.HTTPServer((host, port), _Handler)
+    except OSError as e:
+        print(f"[metrics] could not bind {host}:{port}: {e}; disabled", file=sys.stderr)
+        return None
+    t = threading.Thread(target=httpd.serve_forever, daemon=True, name="metrics")
+    t.start()
+    print(f"[metrics] listening on http://{host}:{port}/metrics", file=sys.stderr)
+    return httpd
+
+
+# ---------------------------------------------------------------------------
+# Notify-on-park (env-gated webhook)
+# ---------------------------------------------------------------------------
+
+
+def _notify_park(reason: str, banner: str) -> None:
+    """POST a notification to NTFY_URL if set. Best-effort, never raises.
+
+    Compatible with ntfy.sh: bare URL with the body as the message,
+    headers for title/priority/tags.
+    """
+    if not NTFY_URL:
+        return
+    try:
+        requests.post(
+            NTFY_URL,
+            data=banner.encode("utf-8")[:3000],  # ntfy.sh caps at 4KB
+            headers={
+                "Title": f"discord-wipe parked: {reason}",
+                "Priority": "high",
+                "Tags": "warning,robot",
+            },
+            timeout=10,
+        )
+        print(f"[notify] sent park notification to {NTFY_URL.split('/')[-1]}", file=sys.stderr)
+    except Exception as e:
+        print(f"[notify] failed to send park notification: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # HTTP client + Discord API wrappers
 # ---------------------------------------------------------------------------
 
@@ -200,6 +413,15 @@ class State:
 class AuthError(RuntimeError):
     """Token rejected by Discord (401). Caller must stop and ask the human
     to rotate the token — there is no refresh flow for user tokens."""
+
+
+class StateUnwritableError(RuntimeError):
+    """State directory or file can't be written.
+
+    Treated as a terminal condition by cmd_run — we park instead of
+    crash-looping, because docker's `restart: unless-stopped` would
+    otherwise spin us forever against Discord with no checkpointing.
+    """
 
 
 def _check_auth(r: requests.Response) -> None:
@@ -641,10 +863,14 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
 
             if status == "ok":
                 counters["ok"] += 1
+                METRICS.inc("ok")
             elif status == "gone":
                 counters["gone"] += 1
+                METRICS.inc("gone")
             elif status == "forbidden":
                 counters["forbidden"] += 1
+                METRICS.inc("forbidden")
+            METRICS.extra_sleep_export = extra_sleep
 
             cfg.state.mark(mid)
             grand_done += 1
@@ -800,10 +1026,14 @@ def phase_live_catchup(s: requests.Session, cfg: WipeConfig) -> None:
 
                 if status == "ok":
                     counters["ok"] += 1
+                    METRICS.inc("ok")
                 elif status == "gone":
                     counters["gone"] += 1
+                    METRICS.inc("gone")
                 elif status == "forbidden":
                     counters["forbidden"] += 1
+                    METRICS.inc("forbidden")
+                METRICS.extra_sleep_catchup = extra_sleep
 
                 cfg.state.mark(mid)
                 # max(floor, hint), NOT sum — same rationale as the
@@ -831,6 +1061,76 @@ def cmd_verify(args) -> int:
         print(f"FAIL — {e}", file=sys.stderr)
         return 2
     print(f"OK — @{me.get('username', '?')} (id={me['id']})")
+    return 0
+
+
+def _format_age(iso: Optional[str]) -> str:
+    if not iso:
+        return "never"
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        return iso
+    delta = datetime.now(timezone.utc) - dt
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m {secs % 60}s ago"
+    if secs < 86400:
+        return f"{secs // 3600}h {(secs % 3600) // 60}m ago"
+    return f"{secs // 86400}d {(secs % 86400) // 3600}h ago"
+
+
+def cmd_status(args) -> int:
+    """Print a summary of the on-disk state file.
+
+    Doesn't touch Discord — safe to run while a wipe is in progress.
+    Reads the same state.json the running container writes; the
+    `atomic .tmp + rename` save pattern means we always see a
+    consistent snapshot.
+    """
+    path = args.state
+    if not path.exists():
+        print(f"no state file at {path}")
+        return 1
+    size_kb = path.stat().st_size / 1024
+    try:
+        d = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        print(f"state.json is unreadable: {e}")
+        backups = sorted(path.parent.glob(f"{path.name}.corrupt-*"))
+        if backups:
+            print(f"  backup files present: {[b.name for b in backups]}")
+        return 2
+
+    n_deleted = len(d.get("deleted", []))
+    consumed = bool(d.get("export_consumed", False))
+    last_pass = d.get("last_pass_at")
+    last_start = d.get("last_started_at")
+    burst = int(d.get("restart_burst", 0) or 0)
+
+    print(f"state file:       {path} ({size_kb:.1f} KB)")
+    print(f"deleted IDs:      {n_deleted:,}")
+    print(f"export consumed:  {consumed}")
+    print(f"last pass:        {last_pass or 'never'} ({_format_age(last_pass)})")
+    print(f"last start:       {last_start or 'never'} ({_format_age(last_start)})")
+    print(f"restart_burst:    {burst}")
+
+    hb = path.with_name("heartbeat")
+    if hb.exists():
+        hb_age = time.time() - hb.stat().st_mtime
+        print(f"heartbeat:        {hb} ({hb_age:.0f}s ago)")
+    else:
+        print("heartbeat:        (none)")
+
+    backups = sorted(path.parent.glob(f"{path.name}.corrupt-*"))
+    if backups:
+        print(f"corrupt backups:  {len(backups)} ({backups[-1].name} most recent)")
+
+    if n_deleted:
+        sample = sorted(d.get("deleted", []))[:3]
+        print(f"sample IDs:       {sample}")
     return 0
 
 
@@ -869,17 +1169,35 @@ def cmd_discover(args) -> int:
     return 0
 
 
-def _auth_paused_exit(token_hint: str, reason: str) -> int:
-    """Discord rejected our token. Park the container until SIGTERM.
+def _park_until_sigterm(banner: str, reason: str) -> int:
+    """Print FATAL banner, fire the notify-on-park webhook if configured,
+    flag METRICS as parked, and sleep in 5s chunks until SIGTERM.
 
-    Critical safety behaviour: do NOT exit non-zero in a tight loop. With
-    Docker's `restart: unless-stopped` policy that would re-launch us
-    immediately, hitting Discord again with the same dead token — a fast
-    track to abuse-flagging the account. Sleep for a long time instead;
-    `docker compose up -d` with a new .env will SIGTERM us awake.
+    Shared base for every "park" exit path (401 / identity / state /
+    restart-burst). Returns 0 — docker treats that as a clean exit AND
+    `restart: unless-stopped` does NOT re-spawn on clean exits, so the
+    container stays as it is until the operator intervenes.
     """
-    print(
-        "\n" + "=" * 72 + "\n"
+    print("\n" + banner + "\n" + "=" * 72, file=sys.stderr, flush=True)
+    METRICS.parked = True
+    METRICS.park_reason = reason
+    _notify_park(reason, banner)
+    while not STOP:
+        time.sleep(5)
+    return 0
+
+
+def _auth_paused_exit(token_hint: str, reason: str) -> int:
+    """Discord rejected our token (401) or the identity changed.
+
+    Critical safety: do NOT exit non-zero in a tight loop. With Docker's
+    `restart: unless-stopped` policy that would re-launch us immediately,
+    hitting Discord again with the same dead token — a fast track to
+    abuse-flagging the account. Park indefinitely; `docker compose up -d`
+    with a new .env sends us SIGTERM.
+    """
+    banner = (
+        "=" * 72 + "\n"
         "[FATAL] DISCORD TOKEN REJECTED.\n\n"
         f"reason: {reason}\n"
         f"token: {token_hint}\n\n"
@@ -889,19 +1207,64 @@ def _auth_paused_exit(token_hint: str, reason: str) -> int:
         "  - Discord rotated it (suspected abuse / token-theft scanner).\n\n"
         "To rotate:\n"
         "  1. Grab the new Authorization header from DevTools.\n"
-        "  2. Edit /mnt/user/appdata/discord-wipe/.env on servarr.\n"
+        "  2. Edit /mnt/user/composer/stacks/discord-wipe/.env on servarr.\n"
         "  3. `docker compose up -d` (recreates the container with the\n"
         "     new env, sending us a graceful SIGTERM).\n\n"
         "Sleeping until SIGTERM. Container stays alive but idle so\n"
         "restart-unless-stopped doesn't spin and the dashboard shows\n"
-        "a clear cause.\n" + "=" * 72,
-        file=sys.stderr,
-        flush=True,
+        "a clear cause."
     )
-    # Sleep in 5s chunks so SIGTERM is responsive.
-    while not STOP:
-        time.sleep(5)
-    return 0
+    return _park_until_sigterm(banner, "token-rejected")
+
+
+def _state_unwritable_exit(detail: str) -> int:
+    """State directory or file can't be written. Park until SIGTERM.
+
+    Without this, an unwritable state path (FS full, mount frozen, perms
+    wrong) would crash the script every pass and `restart: unless-stopped`
+    would respawn us into a hot loop. Park so the operator notices.
+    """
+    banner = (
+        "=" * 72 + "\n"
+        "[FATAL] STATE FILE UNWRITABLE.\n\n"
+        f"reason: {detail}\n\n"
+        "Common causes:\n"
+        "  - The bind-mount target doesn't exist on the host.\n"
+        "  - The host disk hosting /mnt/user/discord-wipe/state is full.\n"
+        "  - The filesystem has frozen (Unraid shfs / array degraded).\n"
+        "  - Permissions are wrong (state dir should be 99:100 on Unraid).\n\n"
+        "To recover:\n"
+        "  1. ssh servarr 'ls -la /mnt/user/discord-wipe/state/'\n"
+        "  2. Fix ownership / free space / unfreeze the filesystem.\n"
+        "  3. `docker compose up -d` to recreate the container.\n\n"
+        "Sleeping until SIGTERM."
+    )
+    return _park_until_sigterm(banner, "state-unwritable")
+
+
+def _restart_burst_exit(count: int) -> int:
+    """Container has restarted >RESTART_BURST_MAX times in the last
+    RESTART_BURST_WINDOW seconds. Park instead of looping further.
+
+    A broken `:main` image or a config-level bug would otherwise spin
+    docker forever; this guard catches it and surfaces the cause.
+    """
+    banner = (
+        "=" * 72 + "\n"
+        "[FATAL] RESTART BURST DETECTED.\n\n"
+        f"This container has started {count} times within the last "
+        f"{RESTART_BURST_WINDOW}s. Something is crashing it on startup "
+        f"and `restart: unless-stopped` keeps respawning it.\n\n"
+        "Recent crashes are visible via:\n"
+        "  ssh servarr 'docker logs --tail 200 discord-wipe'\n\n"
+        "Common causes:\n"
+        "  - A broken release on :main — pin DISCORD_WIPE_TAG=<previous-sha>.\n"
+        "  - Token missing / file empty.\n"
+        "  - Required path doesn't exist (export/ or state/).\n\n"
+        "Sleeping until SIGTERM. Reset the burst counter by editing\n"
+        "`restart_burst: 0` in state.json after fixing the cause."
+    )
+    return _park_until_sigterm(banner, "restart-burst")
 
 
 def _token_hint(token: str) -> str:
@@ -913,6 +1276,32 @@ def _token_hint(token: str) -> str:
 
 def cmd_run(args) -> int:
     install_signal_handlers()
+    print(f"[run] discord-wipe v{__version__}")
+
+    # Construct State first — it can raise StateUnwritableError if the
+    # bind-mount is missing or unwritable. Catch and park instead of
+    # crashing into the restart loop.
+    try:
+        state = State(args.state)
+    except StateUnwritableError as e:
+        return _state_unwritable_exit(str(e))
+
+    # Restart-burst guard. If we've started >RESTART_BURST_MAX times in
+    # the last RESTART_BURST_WINDOW seconds, something is crashing us on
+    # startup. Park rather than keep spinning.
+    state.record_start()
+    if state.restart_burst > RESTART_BURST_MAX:
+        return _restart_burst_exit(state.restart_burst)
+    try:
+        state.save()
+    except StateUnwritableError as e:
+        return _state_unwritable_exit(str(e))
+
+    # Wire metrics: State for gauges, server for /metrics.
+    METRICS.state = state
+    if METRICS_ENABLED:
+        _start_metrics_server(METRICS, METRICS_BIND)
+
     s = make_session(args.token)
     try:
         me = get_me(s)
@@ -920,10 +1309,9 @@ def cmd_run(args) -> int:
         return _auth_paused_exit(_token_hint(args.token), str(e))
     print(f"[run] authenticated as @{me.get('username')} (id={me['id']})")
 
-    state = State(args.state)
     print(
         f"[run] state: {args.state} ({len(state.deleted)} IDs already done; "
-        f"export_consumed={state.export_consumed})"
+        f"export_consumed={state.export_consumed}; restart_burst={state.restart_burst})"
     )
 
     while True:
@@ -957,6 +1345,8 @@ def cmd_run(args) -> int:
         )
         print(f"\n[run] === pass start: cutoff={cutoff.isoformat()} ===")
         t0 = time.time()
+        METRICS.last_pass_start = t0
+        METRICS.parked = False
 
         try:
             if args.export_dir.exists() and not state.export_consumed:
@@ -971,12 +1361,19 @@ def cmd_run(args) -> int:
         except AuthError as e:
             return _auth_paused_exit(_token_hint(args.token), str(e))
 
+        except StateUnwritableError as e:
+            return _state_unwritable_exit(str(e))
+
         except requests.HTTPError as e:
             print(f"[run] HTTP error: {e} {getattr(e.response, 'text', '')[:300]}", file=sys.stderr)
 
         state.last_pass_at = datetime.now(timezone.utc).isoformat()
-        state.save()
+        try:
+            state.save()
+        except StateUnwritableError as e:
+            return _state_unwritable_exit(str(e))
         elapsed = time.time() - t0
+        METRICS.last_pass_end = time.time()
         print(f"[run] === pass complete in {elapsed:.0f}s ===")
 
         if STOP:
@@ -988,11 +1385,17 @@ def cmd_run(args) -> int:
         sleep_for = args.interval_hours * 3600
         wake_at = datetime.now(timezone.utc) + timedelta(seconds=sleep_for)
         print(f"[run] sleeping {sleep_for}s; next pass at {wake_at.isoformat()}")
-        # Sleep in small chunks so SIGTERM responds quickly.
+        # Sleep in small chunks so SIGTERM responds quickly. Touch the
+        # heartbeat every minute so HEALTHCHECK stays green across the
+        # long inter-pass sleep.
         slept = 0.0
+        last_heartbeat = time.time()
         while slept < sleep_for and not STOP:
             time.sleep(min(5.0, sleep_for - slept))
             slept += 5.0
+            if time.time() - last_heartbeat >= 60:
+                state.touch_heartbeat()
+                last_heartbeat = time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -1021,6 +1424,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--export-dir", type=pathlib.Path, default=DEFAULT_EXPORT)
     p.set_defaults(func=cmd_discover)
 
+    p = sub.add_parser("status", help="read state.json and print a summary (no API calls)")
+    p.add_argument("--state", type=pathlib.Path, default=DEFAULT_STATE)
+    p.set_defaults(func=cmd_status)
+
     p = sub.add_parser("run", help="run wipe pass(es)")
     p.add_argument("--export-dir", type=pathlib.Path, default=DEFAULT_EXPORT)
     p.add_argument("--state", type=pathlib.Path, default=DEFAULT_STATE)
@@ -1039,9 +1446,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--search-delay",
         type=float,
-        default=float(os.environ.get("SEARCH_DELAY", "30.0")),
-        help="seconds between search-API page fetches; "
-        "long enough for the search index to refresh (default 30)",
+        default=float(os.environ.get("SEARCH_DELAY", "15.0")),
+        help="seconds between search-API page fetches; long enough for "
+        "the search index to refresh between deletes (default 15; "
+        "v0.3.x default was 30, halved in v0.4.0 — Discord's index "
+        "refreshes in ~5-10s in practice)",
     )
     p.add_argument(
         "--interval-hours",
@@ -1065,7 +1474,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if not args.token:
+    # `status` is the only token-less subcommand — it only reads state.json.
+    if args.cmd != "status" and not args.token:
         print("ERROR: no token. Set DISCORD_TOKEN env var or pass --token.", file=sys.stderr)
         return 2
     return args.func(args)

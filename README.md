@@ -185,10 +185,12 @@ docker logs -f discord-wipe
 | What | How |
 |---|---|
 | Status / live log | `ssh servarr docker logs -f discord-wipe` |
-| Count deleted so far | `ssh servarr 'jq ".deleted \| length, .export_consumed, .last_pass_at" /mnt/user/discord-wipe/state/state.json'` |
+| State summary (no API call) | `ssh servarr docker exec discord-wipe discord-wipe status` (v0.4.0+) |
+| Prometheus scrape | `curl http://servarr.local:9090/metrics` (v0.4.0+; localhost-mapped) |
 | Pause cleanly | `ssh servarr docker stop discord-wipe` (state is saved on SIGTERM) |
 | Resume | `ssh servarr docker start discord-wipe` |
 | Force re-run export phase | stop, edit `state/state.json`, set `"export_consumed": false`, start |
+| Reset restart-burst counter | edit `state/state.json`, set `"restart_burst": 0`, restart (v0.4.0+) |
 | Skip a guild/DM | edit compose.yaml `command:` to add `--exclude-guild ID` or `--exclude-channel ID`, `docker compose up -d` |
 | Tighten/loosen retention | bump `RETENTION_DAYS` in compose.yaml, `docker compose up -d` |
 | Bump speed | drop `DELETE_DELAY` toward 0.3s. Header-driven pacer handles per-bucket throttling automatically; the floor mostly defends against account-level abuse heuristics. |
@@ -225,6 +227,19 @@ docker logs -f discord-wipe
   as Discord returns 404 (`gone`) for already-deleted IDs. Plan ~6h
   extra wall time on the next pass. See `docs/OPERATIONS.md` for
   forensic recovery of the backup file.
+- **State unwritable** (v0.4.0+) — disk full, FS frozen, perms wrong,
+  or bind-mount target missing. Daemon parks itself with a FATAL
+  banner (same shape as 401) and the configured `NTFY_URL` webhook
+  fires if set. Container stays alive but idle so docker's
+  `restart: unless-stopped` doesn't spin.
+- **Restart burst** (v0.4.0+) — if the container has restarted >5
+  times in <10 minutes (counter persisted in `state.json`), the
+  daemon parks itself instead of crashing into another restart.
+  Defends against a broken `:main` image looping forever.
+- **Identity change** (v0.3.1+) — same banner shape as 401, fires when
+  the per-pass pre-flight `/users/@me` returns a different `id` than
+  the one cached at startup (token was swapped to a different
+  account). Same resolution: edit `.env` back, `docker compose up -d`.
 - **Discord API changes** — the search endpoint occasionally moves
   fields around. If you start seeing `unexpected 4xx` logs, check
   upstream tools (victornpb/undiscord, OrbitalCheese/undiscord-lite)
@@ -240,6 +255,40 @@ tune the delays toward zero.
 
 You can only delete your own messages; this is an API-level
 restriction, not a script limitation.
+
+## Observability (v0.4.0+)
+
+Every save() touches `/data/state/heartbeat` (the bind-mounted state
+dir). Three layers consume that:
+
+- **Docker HEALTHCHECK** — inspects the file's mtime every 5 minutes;
+  marks the container unhealthy if it's >25h old (covers a full
+  inter-pass sleep + buffer). Visible in the composer dashboard and
+  via `docker ps`.
+- **`discord-wipe status`** — prints heartbeat age along with state
+  summary. Run from inside the container or outside (just point
+  `--state` at the bind-mount path).
+- **Prometheus `/metrics`** on port 9090 (localhost-bound by compose):
+  - `discord_wipe_deletes_total{outcome="ok|gone|forbidden"}`
+  - `discord_wipe_state_deleted_count` gauge
+  - `discord_wipe_export_consumed` gauge
+  - `discord_wipe_parked` gauge (1 = the daemon hit a fatal park path)
+  - `discord_wipe_extra_sleep_seconds{phase="export|catchup"}` gauge
+    (current per-bucket pacing floor in each phase)
+  - `discord_wipe_last_pass_{start,end}_seconds` gauge
+
+Set `METRICS_ENABLED=0` in `.env` to disable the server. Set
+`METRICS_BIND=127.0.0.1:9090` to bind localhost-only inside the
+container (compose already only maps localhost-outside, so this is
+only relevant if you remove the port map).
+
+### Push notifications on park
+
+Set `NTFY_URL=https://ntfy.sh/<your-topic>` (or any ntfy.sh-compatible
+endpoint) in `.env`. The daemon POSTs to it whenever it enters a
+parked state — 401 token rejected, identity-change, state-unwritable,
+or restart-burst. Body is the full FATAL banner; headers carry the
+reason as `Title:`.
 
 ## What gets logged (and why)
 

@@ -19,15 +19,29 @@ services:
       context: .
     container_name: discord-wipe
     restart: unless-stopped
+    # Give state.save() room on slow disks before docker SIGKILLs us.
+    # State is small (~2MB at 100K IDs) so 30s is generous even on a
+    # degraded array.
+    stop_grace_period: 30s
     env_file:
       - .env
     environment:
       RETENTION_DAYS: "7"
       DELETE_DELAY: "1.0"
-      SEARCH_DELAY: "30.0"
+      # Halved from v0.3.x default (was 30s) — Discord's search index
+      # refreshes in ~5-10s in practice.
+      SEARCH_DELAY: "15.0"
       INTERVAL_HOURS: "24"
       WATCH: "1"
+      METRICS_ENABLED: "1"
+      METRICS_BIND: "0.0.0.0:9090"
+      # Optional: set NTFY_URL=https://ntfy.sh/<your-topic> in .env
+      # to receive push notifications when the daemon parks itself.
       TZ: "Europe/Amsterdam"
+    # Localhost-only metrics endpoint. Prometheus on the same host can
+    # scrape http://127.0.0.1:9090/metrics; external access is blocked.
+    ports:
+      - "127.0.0.1:9090:9090"
     volumes:
       # ABSOLUTE host paths — composer-managed stacks run via a daemon
       # inside a container, so relative `./` paths resolve to the

@@ -56,8 +56,10 @@ Everything you do day-to-day with discord-wipe on `servarr`.
 | Live log | `ssh servarr docker logs -f discord-wipe` (or composer dashboard at `composer.erfi.io`) |
 | Composer log API | `curl -sf -H "X-API-Key: $COMPOSER_API_KEY" https://composer.erfi.io/api/v1/containers/<container-id>/logs?tail=200 \| jq -r '.logs[]'` |
 | Recent errors | `ssh servarr 'docker logs discord-wipe 2>&1 \| rg -i "error\|429\|forbidden\|fatal\|terminal 400"'` |
+| State summary (v0.4.0+) | `ssh servarr docker exec discord-wipe discord-wipe status` (no API call; reads state.json + heartbeat directly) |
+| Prometheus scrape | `ssh servarr curl -s http://127.0.0.1:9090/metrics` (v0.4.0+; localhost-bound on the host) |
 | Deleted count | `ssh servarr 'jq ".deleted \| length" /mnt/user/discord-wipe/state/state.json'` |
-| State summary | `ssh servarr 'jq "{deleted: (.deleted\|length), export_consumed, last_pass_at, total_passes}" /mnt/user/discord-wipe/state/state.json'` |
+| State summary (raw) | `ssh servarr 'jq "{deleted: (.deleted\|length), export_consumed, last_pass_at, restart_burst}" /mnt/user/discord-wipe/state/state.json'` |
 | Pause cleanly | `ssh servarr docker stop discord-wipe` (SIGTERM, state saved) |
 | Resume | `ssh servarr docker start discord-wipe` |
 | Force pass now | `ssh servarr docker restart discord-wipe` (interrupts current sleep, starts fresh pass) |
@@ -135,6 +137,64 @@ Every `INTERVAL_HOURS` (default 24):
 On a typical day you'll see Phase 2 find 0-50 messages per scope and
 wrap up in a few minutes.
 
+## Observability (v0.4.0+)
+
+Four layers feed status info to operators:
+
+1. **Heartbeat file** at `/data/state/heartbeat` (bind-mounted to
+   `/mnt/user/discord-wipe/state/heartbeat`). Touched on every
+   `state.save()` during a pass + every 60s during the long
+   inter-pass sleep. Used by:
+
+2. **Docker HEALTHCHECK** — inspects heartbeat mtime, marks unhealthy
+   if older than 25h (covers a full INTERVAL_HOURS=24 sleep + buffer).
+   Visible in composer's dashboard and `docker ps`.
+
+3. **`discord-wipe status`** subcommand — reads state.json +
+   heartbeat, prints a no-API-call summary. Safe to run while a
+   wipe is in progress (state writes are atomic via `.tmp + rename`).
+   Run from anywhere with read access to the bind-mount:
+   ```sh
+   ssh servarr docker exec discord-wipe discord-wipe status
+   # or, directly against the host file:
+   ssh servarr 'python3 -c "
+   import json; d=json.load(open(\"/mnt/user/discord-wipe/state/state.json\"))
+   print({k: d.get(k) for k in [\"export_consumed\",\"last_pass_at\",\"restart_burst\"]})
+   "'
+   ```
+
+4. **Prometheus `/metrics`** on port 9090. Compose maps it to
+   `127.0.0.1:9090` on the host so external scrapers are blocked.
+   Local Prom config:
+   ```yaml
+   - job_name: discord-wipe
+     static_configs:
+       - targets: ['127.0.0.1:9090']
+   ```
+   Series emitted:
+   - `discord_wipe_deletes_total{outcome="ok|gone|forbidden"}`
+   - `discord_wipe_state_deleted_count`
+   - `discord_wipe_export_consumed`
+   - `discord_wipe_parked`
+   - `discord_wipe_extra_sleep_seconds{phase="export|catchup"}` —
+     current pacing floor; useful for spotting bucket-tightening
+   - `discord_wipe_last_pass_{start,end}_seconds`
+
+### Push notifications on park
+
+Set `NTFY_URL=https://ntfy.sh/<topic>` in `.env`:
+
+```sh
+ssh servarr 'cat >> /mnt/user/composer/stacks/discord-wipe/.env <<EOF
+NTFY_URL=https://ntfy.sh/discord-wipe-yourname
+EOF
+docker compose up -d discord-wipe'
+```
+
+The daemon POSTs a high-priority notification on every park event
+(401, identity-change, state-unwritable, restart-burst). Subscribe
+to the topic on your phone or any ntfy client.
+
 ## Failure modes
 
 ### 401 — token rejected
@@ -157,6 +217,37 @@ identity changed mid-loop: was @oldname (id=...), now @newname (id=...)
 ```
 Resolution: edit `.env` back to the right account's token and
 `docker compose up -d` (same SIGTERM handshake as the 401 case).
+
+### State-unwritable — disk full, FS frozen, perms wrong (v0.4.0+)
+
+When `state.save()` raises `OSError` (the bind-mount target is
+missing, the filesystem is full / frozen, or ownership is wrong),
+the daemon parks itself with a FATAL banner explaining the cause.
+Fires `NTFY_URL` if configured.
+
+Without this guard, an unwritable state path would crash the script
+every pass and `restart: unless-stopped` would respawn it into a hot
+loop. Diagnose:
+```sh
+ssh servarr 'ls -la /mnt/user/discord-wipe/state/ && df -h /mnt/user/'
+```
+Fix permissions (`chown 99:100`) or free space, then
+`docker compose up -d` to recreate the container.
+
+### Restart burst — broken release looping (v0.4.0+)
+
+If the container has restarted >5 times within 600 seconds (counter
+persisted in `state.json` as `restart_burst`), the daemon parks
+itself instead of letting `restart: unless-stopped` keep spinning.
+Defends against a broken `:main` image, missing token, or any
+crash-on-startup condition.
+
+Reset by editing `state.json` (`"restart_burst": 0`) AFTER fixing
+the cause, then `docker compose up -d`.
+Or pin to a known-good build via `.env`:
+```
+DISCORD_WIPE_TAG=sha-<previous-good-short>
+```
 
 ### 429 — rate-limited
 
