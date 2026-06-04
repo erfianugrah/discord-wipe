@@ -249,6 +249,20 @@ Or pin to a known-good build via `.env`:
 DISCORD_WIPE_TAG=sha-<previous-good-short>
 ```
 
+**Note (v0.4.1+):** a transient *network* failure no longer counts
+toward the burst. Every Discord-bound call retries connection-level
+errors (DNS resolution failure, connection reset, timeout) with
+bounded backoff before giving up, so a host-reboot "discord.com not
+yet resolvable" blip rides out instead of crashing. A successful auth
+also resets `restart_burst` to 0. So if you find the daemon parked on
+restart-burst, the cause is a genuine crash-on-startup (broken image,
+bad token file, missing path) — not a network hiccup. A daemon parked
+by the pre-0.4.1 DNS bug recovers on its own the next time you redeploy
+(the >600s gap since the parked start resets the counter); if you
+redeploy within 10 minutes of the park, reset `restart_burst` manually.
+Tune the retry budget with `NET_RETRY_MAX` (default 8 attempts),
+`NET_RETRY_BASE` (2.0s), `NET_RETRY_CAP` (30.0s) in `.env`.
+
 ### 429 — rate-limited
 
 Handled. The script reads `retry_after` from the body (or

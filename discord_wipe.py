@@ -58,7 +58,7 @@ import requests
 # Constants
 # ---------------------------------------------------------------------------
 
-__version__ = "0.4.0"  # bump on every behaviour change; tag releases as vX.Y.Z
+__version__ = "0.4.1"  # bump on every behaviour change; tag releases as vX.Y.Z
 
 API = "https://discord.com/api/v10"
 DISCORD_EPOCH_MS = 1420070400000  # 2015-01-01T00:00:00Z
@@ -78,6 +78,21 @@ USER_AGENT = (
 # `restart: unless-stopped` spin us forever against Discord.
 RESTART_BURST_MAX = 5
 RESTART_BURST_WINDOW = 600  # 10 minutes
+
+# Transient-network retry (v0.4.1+). Discord-bound HTTP calls retry on
+# connection-level failures — DNS resolution, connection reset, read
+# timeout — before giving up. The canonical trigger is a host reboot:
+# every container starts at once, often before the Docker network /
+# upstream resolver is ready, so discord.com fails to resolve for a few
+# seconds. Without retry that ConnectionError crashes the daemon on its
+# very first call (get_me); docker's `restart: unless-stopped` respawns
+# it; six crashes inside RESTART_BURST_WINDOW trip the restart-burst
+# guard and PARK the daemon on what was a self-healing 30-second blip.
+# Bounded exponential backoff rides the blip out so the process never
+# crashes. Defaults: 8 attempts, 2s base, 30s cap → ~2min ride-out/call.
+NET_RETRY_MAX = int(os.environ.get("NET_RETRY_MAX", "8") or 8)
+NET_RETRY_BASE = float(os.environ.get("NET_RETRY_BASE", "2.0") or 2.0)
+NET_RETRY_CAP = float(os.environ.get("NET_RETRY_CAP", "30.0") or 30.0)
 
 # Metrics server bind (v0.4.0+). Default 0.0.0.0:9090 inside the container;
 # compose maps it to 127.0.0.1:9090 on the host so only same-host scrapers
@@ -451,22 +466,60 @@ def make_session(token: str) -> requests.Session:
     return s
 
 
+def _net_sleep(seconds: float) -> None:
+    """Sleep up to `seconds` in <=1s slices, waking early when STOP is set."""
+    slept = 0.0
+    while slept < seconds and not STOP:
+        time.sleep(min(1.0, seconds - slept))
+        slept += 1.0
+
+
+def _request(s: requests.Session, method: str, url: str, **kwargs) -> requests.Response:
+    """HTTP with bounded retry on transient connection failures.
+
+    Dispatches to s.get / s.delete so the per-verb session method stays
+    the boundary the tests mock. Retries ONLY connection-level errors
+    (DNS resolution failure, connection reset, read timeout). An HTTP
+    response of ANY status is returned untouched, because 4xx/5xx carry
+    semantics the callers decode (401->AuthError, 429->retry hint,
+    403->forbidden) and must not be swallowed here. Re-raises once the
+    retry budget is spent or STOP is set, so a sustained outage still
+    surfaces. See NET_RETRY_* for the host-reboot DNS-not-ready rationale.
+    """
+    fn = s.get if method == "GET" else s.delete
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return fn(url, **kwargs)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            if STOP or attempt >= NET_RETRY_MAX:
+                raise
+            delay = min(NET_RETRY_CAP, NET_RETRY_BASE * (2 ** (attempt - 1)))
+            print(
+                f"[net] transient {type(e).__name__} on {method} {url} "
+                f"(attempt {attempt}/{NET_RETRY_MAX}); retrying in {delay:.0f}s",
+                file=sys.stderr,
+            )
+            _net_sleep(delay)
+
+
 def get_me(s: requests.Session) -> dict:
-    r = s.get(f"{API}/users/@me", timeout=30)
+    r = _request(s, "GET", f"{API}/users/@me", timeout=30)
     _check_auth(r)
     r.raise_for_status()
     return r.json()
 
 
 def list_my_guilds(s: requests.Session) -> list[dict]:
-    r = s.get(f"{API}/users/@me/guilds", timeout=30)
+    r = _request(s, "GET", f"{API}/users/@me/guilds", timeout=30)
     _check_auth(r)
     r.raise_for_status()
     return r.json()
 
 
 def list_my_dms(s: requests.Session) -> list[dict]:
-    r = s.get(f"{API}/users/@me/channels", timeout=30)
+    r = _request(s, "GET", f"{API}/users/@me/channels", timeout=30)
     _check_auth(r)
     r.raise_for_status()
     return r.json()
@@ -497,7 +550,7 @@ def search_messages(
         "offset": offset,
         "include_nsfw": "true",
     }
-    r = s.get(url, params=params, timeout=60)
+    r = _request(s, "GET", url, params=params, timeout=60)
     _check_auth(r)
 
     if r.status_code == 429:
@@ -575,7 +628,7 @@ def delete_message(s: requests.Session, channel_id: str, msg_id: str) -> tuple[s
                     until a 204/404 refreshes the bucket estimate.
     """
     url = f"{API}/channels/{channel_id}/messages/{msg_id}"
-    r = s.delete(url, timeout=30)
+    r = _request(s, "DELETE", url, timeout=30)
     _check_auth(r)
 
     if r.status_code == 204:
@@ -1309,6 +1362,16 @@ def cmd_run(args) -> int:
         return _auth_paused_exit(_token_hint(args.token), str(e))
     print(f"[run] authenticated as @{me.get('username')} (id={me['id']})")
 
+    # We authenticated — network, token, and identity are all healthy,
+    # which rules out every crash-loop cause the restart-burst guard
+    # defends against (all of them manifest before this line). Clear the
+    # counter so a past transient blip doesn't leave the guard primed to
+    # false-fire on the next unrelated restart.
+    if state.restart_burst:
+        state.restart_burst = 0
+        with contextlib.suppress(StateUnwritableError):
+            state.save()
+
     print(
         f"[run] state: {args.state} ({len(state.deleted)} IDs already done; "
         f"export_consumed={state.export_consumed}; restart_burst={state.restart_burst})"
@@ -1366,6 +1429,13 @@ def cmd_run(args) -> int:
 
         except requests.HTTPError as e:
             print(f"[run] HTTP error: {e} {getattr(e.response, 'text', '')[:300]}", file=sys.stderr)
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            # A sustained outage outlasted the per-call retry budget. End
+            # the pass cleanly; the between-pass sleep rides it out and the
+            # next pass re-attempts. Crashing here would feed docker's
+            # restart loop / burst guard for a self-healing condition.
+            print(f"[run] network error (outage outlasted retries): {e}", file=sys.stderr)
 
         state.last_pass_at = datetime.now(timezone.utc).isoformat()
         try:

@@ -359,6 +359,39 @@ delete pipeline; all bypassable via env vars):
   in the `Title` header. ntfy.sh-compatible. Best-effort — a
   failed POST is logged and swallowed; never propagates.
 
+## v0.4.1 transient-network retry (restart-burst false-fire fix)
+
+The v0.4.0 restart-burst guard had an unintended trigger: a transient
+DNS failure at startup. On host reboot every container starts at once,
+often before the Docker network / upstream resolver is ready, so
+`discord.com` fails to resolve for a few seconds. The daemon's first
+call is `get_me()`; an uncaught `requests.exceptions.ConnectionError`
+(wrapping `socket.gaierror` / `NameResolutionError`) crashed the
+process. `restart: unless-stopped` respawned it; six crashes inside the
+600s window tripped the burst guard and parked the daemon on what was a
+self-healing 30-second blip. Observed live 2026-06-04.
+
+Fix, three parts:
+
+- **`_request(s, method, url, **kwargs)`** wraps every session call.
+  It dispatches to `s.get`/`s.delete` (keeping the per-verb method as
+  the test mock boundary) and retries ONLY connection-level failures
+  (`ConnectionError`, `Timeout`) with bounded exponential backoff
+  (`NET_RETRY_MAX`=8, `NET_RETRY_BASE`=2s, `NET_RETRY_CAP`=30s →
+  ~2min ride-out per call, all env-tunable). An HTTP *response* of any
+  status passes straight through, so the callers' 401→AuthError,
+  429→retry-hint, 403→forbidden semantics are untouched. STOP
+  short-circuits the loop for prompt SIGTERM shutdown.
+- **Pass-loop catch** for `ConnectionError`/`Timeout` so a sustained
+  outage that outlasts the per-call budget ends the pass cleanly (the
+  inter-pass sleep rides it out) instead of crashing into the restart
+  loop.
+- **Burst reset on successful auth.** Once `get_me()` succeeds, every
+  crash-loop cause the guard defends against (broken image, bad token,
+  missing path — all manifest before auth) is ruled out, so
+  `restart_burst` is reset to 0. The guard stays armed for genuine
+  crash-on-startup loops, which never reach a successful auth.
+
 Shared base: `_park_until_sigterm(banner, reason)` is the single
 function every park path calls. It prints the banner, flags
 `METRICS.parked = True`, fires the notify webhook, and sleeps in 5s

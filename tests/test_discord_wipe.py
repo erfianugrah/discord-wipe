@@ -22,6 +22,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
+import requests
+
 import discord_wipe as dw
 
 # ---------------------------------------------------------------------------
@@ -921,6 +923,130 @@ class V040_StatusSubcommandWorks(unittest.TestCase):
                 rc = dw.cmd_status(args)
             self.assertEqual(rc, 1)
             self.assertIn("no state file", buf.getvalue())
+
+
+class Bug10_TransientNetworkErrorIsRetriedNotFatal(unittest.TestCase):
+    """A transient connection failure (e.g. discord.com DNS not yet
+    resolvable when the container starts on host reboot) must NOT crash
+    the daemon. Crashing feeds docker's `restart: unless-stopped`, and
+    six crashes inside RESTART_BURST_WINDOW trip the restart-burst guard
+    and PARK the daemon on a self-healing 30-second blip. Reported
+    2026-06-04: NameResolutionError on get_me parked a live wipe.
+    _request retries connection-level errors with bounded backoff."""
+
+    def _resp(self, status=200, body=None):
+        r = mock.MagicMock()
+        r.status_code = status
+        r.json.return_value = body if body is not None else {"id": "self", "username": "me"}
+        r.raise_for_status.return_value = None
+        return r
+
+    def test_get_me_retries_transient_connection_error_then_succeeds(self):
+        _reset_stop()
+        sess = mock.MagicMock()
+        sess.get.side_effect = [
+            requests.exceptions.ConnectionError("name resolution failed"),
+            requests.exceptions.ConnectionError("name resolution failed"),
+            self._resp(),
+        ]
+        with mock.patch.object(dw.time, "sleep"):
+            me = dw.get_me(sess)
+        self.assertEqual(me["id"], "self")
+        self.assertEqual(sess.get.call_count, 3)
+
+    def test_request_reraises_after_budget_exhausted(self):
+        _reset_stop()
+        sess = mock.MagicMock()
+        sess.get.side_effect = requests.exceptions.ConnectionError("dns down")
+        with (
+            mock.patch.object(dw, "NET_RETRY_MAX", 3),
+            mock.patch.object(dw.time, "sleep"),
+            self.assertRaises(requests.exceptions.ConnectionError),
+        ):
+            dw._request(sess, "GET", "http://x/")
+        self.assertEqual(sess.get.call_count, 3)
+
+    def test_request_does_not_retry_once_stop_is_set(self):
+        _reset_stop()
+        dw.STOP = True
+        try:
+            sess = mock.MagicMock()
+            sess.get.side_effect = requests.exceptions.ConnectionError("dns down")
+            with (
+                mock.patch.object(dw.time, "sleep"),
+                self.assertRaises(requests.exceptions.ConnectionError),
+            ):
+                dw._request(sess, "GET", "http://x/")
+            # STOP short-circuits the retry loop — exactly one attempt.
+            self.assertEqual(sess.get.call_count, 1)
+        finally:
+            _reset_stop()
+
+    def test_request_returns_http_error_responses_without_retry(self):
+        # A 500 is a *response*, not a connection failure — callers decode
+        # status codes themselves, so _request must hand it back as-is
+        # after a single call (no retry, no swallowing).
+        _reset_stop()
+        sess = mock.MagicMock()
+        sess.delete.return_value = self._resp(status=500)
+        with mock.patch.object(dw.time, "sleep"):
+            r = dw._request(sess, "DELETE", "http://x/")
+        self.assertEqual(r.status_code, 500)
+        self.assertEqual(sess.delete.call_count, 1)
+
+
+class Bug11_SuccessfulAuthClearsRestartBurst(unittest.TestCase):
+    """Once the daemon authenticates, every crash-loop cause the
+    restart-burst guard defends against has been ruled out (they all
+    manifest before auth). cmd_run must reset restart_burst to 0 so a
+    past transient blip doesn't leave the guard primed to false-fire."""
+
+    def test_cmd_run_resets_burst_after_successful_auth(self):
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            sp = tmp / "state.json"
+            now = datetime.now(timezone.utc)
+            # Burst sitting at 3 (below MAX, so we don't park) from a
+            # prior bout of transient failures.
+            sp.write_text(
+                json.dumps(
+                    {
+                        "deleted": [],
+                        "export_consumed": True,
+                        "last_pass_at": None,
+                        "last_started_at": now.isoformat(),
+                        "restart_burst": 3,
+                    }
+                )
+            )
+            args = argparse.Namespace(
+                cmd="run",
+                token="fake",
+                state=sp,
+                export_dir=tmp / "no-export",
+                retention_days=7.0,
+                delete_delay=0.0,
+                search_delay=0.0,
+                interval_hours=24.0,
+                watch=False,
+                dry_run=True,
+                exclude_guild=[],
+                exclude_channel=[],
+            )
+
+            def sleep_then_stop(*_a, **_kw):
+                dw.STOP = True
+
+            with (
+                mock.patch.object(dw, "get_me", return_value={"id": "x", "username": "x"}),
+                mock.patch.object(dw, "phase_live_catchup"),
+                mock.patch.object(dw.time, "sleep", side_effect=sleep_then_stop),
+            ):
+                dw.cmd_run(args)
+
+            reloaded = dw.State(sp)
+            self.assertEqual(reloaded.restart_burst, 0)
 
 
 if __name__ == "__main__":

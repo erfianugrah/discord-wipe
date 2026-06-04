@@ -236,6 +236,13 @@ docker logs -f discord-wipe
   times in <10 minutes (counter persisted in `state.json`), the
   daemon parks itself instead of crashing into another restart.
   Defends against a broken `:main` image looping forever.
+- **Transient network** (v0.4.1+) — every Discord-bound call retries
+  connection-level failures (DNS resolution, connection reset,
+  timeout) with bounded backoff before giving up, so a host-reboot
+  "discord.com not yet resolvable" blip no longer crashes the daemon
+  (and therefore no longer false-fires the restart-burst guard). A
+  successful auth also resets `restart_burst` to 0. Tune with
+  `NET_RETRY_MAX` / `NET_RETRY_BASE` / `NET_RETRY_CAP`.
 - **Identity change** (v0.3.1+) — same banner shape as 401, fires when
   the per-pass pre-flight `/users/@me` returns a different `id` than
   the one cached at startup (token was swapped to a different

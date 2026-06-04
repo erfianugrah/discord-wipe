@@ -13,7 +13,7 @@ older than `RETENTION_DAYS` (default 7). One file of Python (stdlib +
 Stack files live at `/mnt/user/composer/stacks/discord-wipe/` on `servarr`
 (composer-managed git clone); data (export RO, state RW) lives at
 `/mnt/user/discord-wipe/`. Image is published to `ghcr.io/erfianugrah/discord-wipe`.
-Current version: see `__version__` in `discord_wipe.py` (0.4.0 as of this commit).
+Current version: see `__version__` in `discord_wipe.py` (0.4.1 as of this commit).
 
 ## Hard safety rules (read these or break things)
 
@@ -89,6 +89,23 @@ by compose); (e) an opt-in `NTFY_URL` webhook that fires on every
 park event. None of these touch the delete pipeline; all are
 bypassable via env vars.
 
+v0.4.1 fixed a restart-burst false-fire: a transient DNS failure at
+startup (`discord.com` not yet resolvable on host reboot, before the
+Docker network / upstream resolver is ready) crashed `get_me()` with an
+uncaught `ConnectionError`; `restart: unless-stopped` respawned it; six
+crashes inside the 600s window tripped the restart-burst guard and
+PARKED the daemon on a self-healing 30-second blip (observed live
+2026-06-04). Fix: `_request()` wraps every session call with bounded
+exponential-backoff retry on connection-level errors (DNS / reset /
+timeout) — `NET_RETRY_MAX`/`_BASE`/`_CAP` env-tunable, ~2min ride-out
+per call by default; HTTP responses of any status pass through untouched
+so the 401/429/403 semantics are preserved. The pass loop also catches
+`ConnectionError`/`Timeout` so a sustained outage ends the pass cleanly
+instead of crashing, and a successful auth now resets `restart_burst` to
+0 (auth proves none of the crash-loop causes apply). Tests:
+`Bug10_TransientNetworkErrorIsRetriedNotFatal` (4) +
+`Bug11_SuccessfulAuthClearsRestartBurst` (1).
+
 ## Repo layout
 
 ```
@@ -104,11 +121,12 @@ discord-wipe/
 ├── pyproject.toml         ruff config + project metadata
 ├── tests/
 │   ├── __init__.py
-│   └── test_discord_wipe.py  stdlib unittest, 33 tests across 14 classes:
+│   └── test_discord_wipe.py  stdlib unittest, 38 tests across 22 classes:
 │                             3 safety mandate (only-my-messages defence-
-│                             in-depth) + 11 regression (one per fixed bug,
-│                             plus the v0.3.0 anti-GC guards) + 16 v0.4.0
-│                             feature tests (heartbeat, restart-burst,
+│                             in-depth) + 13 regression (one per fixed bug,
+│                             plus the v0.3.0 anti-GC guards + the v0.4.1
+│                             transient-network + burst-reset fixes) + 16
+│                             v0.4.0 feature tests (heartbeat, restart-burst,
 │                             state-unwritable, notify-on-park, metrics,
 │                             status subcommand)
 ├── docs/
