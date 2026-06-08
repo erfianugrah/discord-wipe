@@ -275,14 +275,22 @@ just `docker compose pull && docker compose up -d`. Token lives in
 - **Fix for a diverged / non-fast-forward clone** — reconcile to the
   already-fetched origin ref (no network needed; discards orphaned
   local commits + dirty tracked files, both superseded by origin;
-  untracked `.env` is preserved), then re-sync via the API:
+  untracked `.env` is preserved). **Run git AS the `composer` user
+  (uid 99), never as host root** — a root-run `git reset` rewrites
+  `.git/refs/heads/main` + the checked-out files as root-owned, and
+  then composer (uid 99) can't update the ref, so the next sync dies
+  with `open .git/refs/heads/main: permission denied`. Do it inside the
+  container instead, then re-sync via the API:
   ```sh
-  ssh servarr 'D=/mnt/user/composer/stacks/discord-wipe; \
-    git config --global --add safe.directory "$D"; \
-    git -C "$D" reset --hard refs/remotes/origin/main'
+  ssh servarr 'docker exec -u composer composer sh -c "\
+    git config --global --add safe.directory /opt/stacks/discord-wipe; \
+    git -C /opt/stacks/discord-wipe reset --hard refs/remotes/origin/main"'
   curl -s -X POST -H "X-API-Key: $COMPOSER_API_KEY" \
     https://composer.erfi.io/api/v1/stacks/discord-wipe/sync   # "Git pull + detect changes"
   ```
+  (If you already ran it as root and hit the perms error, repair with
+  `ssh servarr 'find /mnt/user/composer/stacks/discord-wipe -uid 0 -exec chown 99:101 {} +'`
+  then re-sync.)
 
 - **Manual image-only redeploy** (when you just want the latest `:main`
   image without touching git) — note the in-container stack path is
