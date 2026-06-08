@@ -1,5 +1,8 @@
-# Secrets — NEVER commit.
-.env
+# Secrets. `.env` IS committed — but ONLY SOPS-encrypted at rest (age recipient
+# = composer.erfi.io's public key; see .sops.yaml). Composer decrypts it at
+# deploy time. The pre-commit hook (.git/hooks/pre-commit) blocks any commit
+# where .env is still plaintext. NEVER commit a plaintext .env.
+#   encrypt:  sops -e -i .env      decrypt-to-edit:  sops -d -i .env
 
 # Runtime state.
 state/

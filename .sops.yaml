@@ -1,0 +1,14 @@
+# SOPS + age secret management.
+#
+# `.env` is committed to git ENCRYPTED. Composer decrypts it at deploy time
+# using its loaded age key (COMPOSER_SOPS_AGE_KEY); the recipient below MUST
+# match composer.erfi.io's age public key (as of 2026-05-24).
+#
+# Encrypt before committing (the pre-commit hook blocks a plaintext .env):
+#     sops --encrypt --in-place .env        # or: sops -e -i .env
+# Decrypt to edit:
+#     sops --decrypt --in-place .env        # then re-encrypt before commit
+#
+creation_rules:
+  - path_regex: (^|/)\.env$
+    age: age15jdwjecd05un3cclyxdhh32zm8xsrt4uv5fk73tjq70d8che43xqsk8sa9
