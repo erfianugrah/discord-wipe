@@ -52,11 +52,17 @@ services:
       - ${DISCORD_WIPE_DATA_DIR:-/mnt/user/discord-wipe}/state:/data/state
     # No inbound network. Default bridge with outbound-only is plenty.
     # Resource caps so a runaway loop can't eat the host.
+    # 512M (was 256M): the one-shot export re-parse loads all ~194
+    # channels' messages.json into memory at once. With export_consumed
+    # cached that phase is skipped (steady state ~45M), but a fresh
+    # export / state reset re-runs it and 256M OOM-killed the container
+    # mid-write — which, pre-0.4.3, truncated state.json to 0 bytes and
+    # forced a full re-grind. 512M gives the re-parse headroom.
     deploy:
       resources:
         limits:
           cpus: "0.5"
-          memory: "256M"
+          memory: "512M"
     logging:
       driver: json-file
       options:
