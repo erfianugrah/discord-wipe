@@ -1049,5 +1049,28 @@ class Bug11_SuccessfulAuthClearsRestartBurst(unittest.TestCase):
             self.assertEqual(reloaded.restart_burst, 0)
 
 
+class V042_DurationFormatHandlesMultiDayPasses(unittest.TestCase):
+    """The initial full-history drain legitimately runs for days, so the
+    pass-complete readout must degrade gracefully from seconds to days
+    instead of printing a raw '313685s'. Observed live 2026-06-08: a
+    first pass completed in 313685s and logged it as an unreadable
+    seconds blob. _format_duration adds a days tier; the print keeps the
+    raw seconds in parens so the line stays greppable."""
+
+    def test_seconds_minutes_hours_tiers(self):
+        self.assertEqual(dw._format_duration(0), "0s")
+        self.assertEqual(dw._format_duration(45), "45s")
+        self.assertEqual(dw._format_duration(252), "4m12s")
+        self.assertEqual(dw._format_duration(80000), "22h13m")
+
+    def test_multi_day_pass_shows_days(self):
+        # The exact value seen in production on 2026-06-08.
+        self.assertEqual(dw._format_duration(313685), "3d15h8m")
+
+    def test_nan_and_negative_are_safe(self):
+        self.assertEqual(dw._format_duration(-1), "?")
+        self.assertEqual(dw._format_duration(float("nan")), "?")
+
+
 if __name__ == "__main__":
     unittest.main()

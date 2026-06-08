@@ -2,7 +2,7 @@
 
 Rolling-retention deleter for your own Discord messages. Runs as a
 long-lived container; every pass it deletes everything you posted older
-than `RETENTION_DAYS` (default 7). Sleeps `INTERVAL_HOURS`, repeats.
+than `RETENTION_DAYS` (default 14). Sleeps `INTERVAL_HOURS`, repeats.
 
 Two phases per pass:
 
@@ -110,7 +110,7 @@ export DISCORD_TOKEN='your-token-here'
 ./discord_wipe.py run --dry-run \
    --export-dir ~/erfi-bot/data/exports/discord/package/Messages \
    --state ./state/state.json \
-   --retention-days 7
+   --retention-days 14
 
 # Run the test suite (no network; mocks every Discord helper).
 python3 -m unittest discover -s tests -v

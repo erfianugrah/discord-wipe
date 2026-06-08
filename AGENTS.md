@@ -7,7 +7,7 @@ making any change — most of it is non-obvious from the code alone.
 
 A rolling-retention bulk deleter for **your own** Discord messages. Runs
 forever as a Docker container; every pass deletes everything you posted
-older than `RETENTION_DAYS` (default 7). One file of Python (stdlib +
+older than `RETENTION_DAYS` (default 14). One file of Python (stdlib +
 `requests`), one Dockerfile, one Compose stack.
 
 Stack files live at `/mnt/user/composer/stacks/discord-wipe/` on `servarr`
@@ -179,7 +179,7 @@ mkdir -p state-dryrun
 DISCORD_TOKEN=... python3 discord_wipe.py run --dry-run \
     --export-dir ~/erfi-bot/data/exports/discord/package/Messages \
     --state ./state-dryrun/state.json \
-    --retention-days 7 \
+    --retention-days 14 \
     --search-delay 6
 ```
 

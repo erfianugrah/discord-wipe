@@ -58,7 +58,7 @@ import requests
 # Constants
 # ---------------------------------------------------------------------------
 
-__version__ = "0.4.1"  # bump on every behaviour change; tag releases as vX.Y.Z
+__version__ = "0.4.2"  # bump on every behaviour change; tag releases as vX.Y.Z
 
 API = "https://discord.com/api/v10"
 DISCORD_EPOCH_MS = 1420070400000  # 2015-01-01T00:00:00Z
@@ -738,17 +738,25 @@ class WipeConfig:
     exclude_channels: set[str]
 
 
-def _format_eta(seconds: float) -> str:
-    """Human-friendly ETA string for progress logs (e.g. '22h13m', '4m12s')."""
+def _format_duration(seconds: float) -> str:
+    """Human-friendly duration string for logs (e.g. '3d15h8m', '22h13m',
+    '4m12s'). Used for both ETA progress lines and the pass-complete
+    elapsed readout, so it must stay readable from seconds up to days —
+    the initial full-history drain can legitimately run multiple days."""
     if seconds < 0 or seconds != seconds:  # NaN-safe
         return "?"
     if seconds < 90:
         return f"{seconds:.0f}s"
     if seconds < 3600:
         return f"{seconds // 60:.0f}m{seconds % 60:.0f}s"
-    hours = seconds // 3600
+    if seconds < 86400:
+        hours = seconds // 3600
+        mins = (seconds % 3600) // 60
+        return f"{hours:.0f}h{mins:.0f}m"
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
     mins = (seconds % 3600) // 60
-    return f"{hours:.0f}h{mins:.0f}m"
+    return f"{days:.0f}d{hours:.0f}h{mins:.0f}m"
 
 
 def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path) -> None:
@@ -940,7 +948,7 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
                     f"    {j}/{len(targets)} ok={counters['ok']} "
                     f"gone={counters['gone']} 403={counters['forbidden']} "
                     f"| total: {grand_done}/{grand_total} ({pct:.1f}%) "
-                    f"~{rate * 60:.0f}/min ETA {_format_eta(eta)}"
+                    f"~{rate * 60:.0f}/min ETA {_format_duration(eta)}"
                 )
             # max(floor, header-driven hint), NOT sum. DELETE_DELAY is
             # the safety floor against account-level abuse heuristics;
@@ -1444,7 +1452,9 @@ def cmd_run(args) -> int:
             return _state_unwritable_exit(str(e))
         elapsed = time.time() - t0
         METRICS.last_pass_end = time.time()
-        print(f"[run] === pass complete in {elapsed:.0f}s ===")
+        # Human-readable up front (the initial drain can run for days),
+        # raw seconds in parens so the line stays greppable/parseable.
+        print(f"[run] === pass complete in {_format_duration(elapsed)} ({elapsed:.0f}s) ===")
 
         if STOP:
             print("[run] stop signal — exiting")
@@ -1504,8 +1514,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--retention-days",
         type=float,
-        default=float(os.environ.get("RETENTION_DAYS", "7")),
-        help="messages older than this are deleted (default 7, env RETENTION_DAYS)",
+        default=float(os.environ.get("RETENTION_DAYS", "14")),
+        help="messages older than this are deleted (default 14, env RETENTION_DAYS)",
     )
     p.add_argument(
         "--delete-delay",

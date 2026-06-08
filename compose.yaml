@@ -26,7 +26,7 @@ services:
     env_file:
       - .env
     environment:
-      RETENTION_DAYS: "7"
+      RETENTION_DAYS: "14"
       DELETE_DELAY: "1.0"
       # Halved from v0.3.x default (was 30s) — Discord's search index
       # refreshes in ~5-10s in practice.
