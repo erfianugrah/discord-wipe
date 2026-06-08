@@ -1072,5 +1072,207 @@ class V042_DurationFormatHandlesMultiDayPasses(unittest.TestCase):
         self.assertEqual(dw._format_duration(float("nan")), "?")
 
 
+# ---------------------------------------------------------------------------
+# Bug 12: state.json 0-byte truncation must not lose a completed wipe.
+#
+# 2026-06-08: a *completed* wipe (107,025 IDs, export_consumed=True) was
+# wiped out twice when state.json was truncated to 0 bytes. Root cause: a
+# non-durable write_text()+rename on Unraid's /mnt/user shfs FUSE overlay
+# — the rename metadata journalled but the data pages never flushed when
+# the container was killed in the writeback window. _load() then saw an
+# empty file ("Expecting value: line 1 column 1 (char 0)"), reset to
+# empty, and re-ground ~105k already-deleted messages from scratch
+# against the old-message DELETE rate limit (~16/min, ETA ~4d). Fix:
+# fsync the tmp file before rename + fsync the dir after + keep a .bak
+# the loader falls back to.
+# ---------------------------------------------------------------------------
+
+
+class Bug12_StateSurvivesZeroByteTruncation(unittest.TestCase):
+    def test_second_save_rotates_prior_good_to_backup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sp = pathlib.Path(tmpdir) / "state.json"
+            st = dw.State(sp)
+            st.mark("1038300899979837462")
+            st.save()  # first save: state.json didn't exist -> no .bak yet
+            self.assertFalse(
+                sp.with_name("state.json.bak").exists(),
+                "no .bak should exist after the very first save",
+            )
+            st.mark("1038300940643606579")
+            st.save()  # second save: rotate prior good -> .bak
+            bak = sp.with_name("state.json.bak")
+            self.assertTrue(bak.exists(), "second save must rotate prior good to .bak")
+            self.assertEqual(
+                set(json.loads(bak.read_text())["deleted"]),
+                {"1038300899979837462"},
+                ".bak must hold the PREVIOUS good snapshot",
+            )
+            # Live file holds the newest snapshot.
+            self.assertEqual(
+                set(json.loads(sp.read_text())["deleted"]),
+                {"1038300899979837462", "1038300940643606579"},
+            )
+
+    def test_load_recovers_from_backup_when_live_is_zero_byte(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            sp = tmp / "state.json"
+            st = dw.State(sp)
+            st.deleted = {"1038300899979837462", "1038300940643606579"}
+            st.export_consumed = True
+            st.save()  # creates live
+            st.mark("1038300978111328278")
+            st.save()  # rotates the two-ID snapshot into .bak
+            # Simulate the FUSE no-fsync failure: live file truncated to 0 bytes.
+            sp.write_text("")
+            st2 = dw.State(sp)
+            self.assertTrue(
+                st2.deleted,
+                "must recover the deleted set from .bak, not reset to empty",
+            )
+            self.assertIn("1038300899979837462", st2.deleted)
+            self.assertTrue(
+                st2.export_consumed,
+                "export_consumed must survive recovery from .bak",
+            )
+            # The 0-byte live file was quarantined (auditable), not silently dropped.
+            self.assertTrue(
+                list(tmp.glob("state.json.corrupt-*")),
+                "the 0-byte live file should be moved aside",
+            )
+
+    def test_zero_byte_with_no_backup_starts_fresh_and_quarantines(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            sp = tmp / "state.json"
+            sp.write_text("")  # 0-byte, no .bak available
+            st = dw.State(sp)
+            self.assertEqual(st.deleted, set())
+            self.assertTrue(list(tmp.glob("state.json.corrupt-*")))
+
+
+# ---------------------------------------------------------------------------
+# Bug 13: a 404's normal-bucket hint must NOT collapse the old-message
+# 429 pacing floor.
+#
+# Discord meters single-message DELETE of >14-day-old messages with a
+# SEPARATE, stricter sub-limit. The 429 we hit reports its retry_after
+# (~1.7s), but the immediately-following 404 carries the NORMAL per-
+# channel delete bucket headers (lots of headroom -> a tiny hint).
+# Pre-0.4.3 the clean branch did `extra_sleep = hint`, overwriting the
+# 1.7s floor with ~0.2s, so the next delete re-tripped the old-msg
+# limit -> a 429 on EVERY message (~16/min, observed live 2026-06-08).
+# Fix: clamp clean hints to >= the freshest 429 interval (floor_429).
+# ---------------------------------------------------------------------------
+
+
+class Bug13_404HintDoesNotCollapse429Floor(unittest.TestCase):
+    def test_catchup_404_with_small_hint_keeps_429_floor(self):
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            state = dw.State(tmp / "state.json")
+            cfg = _make_cfg(state, delete_delay=1.0)
+            sess = mock.MagicMock()
+
+            sleeps: list[float] = []
+            # msg-1: 429(1.7) -> 404(hint 0.2, the normal bucket)
+            # msg-2: 404(hint 0.2)  -- clean, but floor must stay 1.7
+            delete_returns = [("retry", 1.7), ("gone", 0.2), ("gone", 0.2)]
+            search_pages = [
+                (
+                    2,
+                    [
+                        {"id": "m1", "channel_id": "c1", "hit": True},
+                        {"id": "m2", "channel_id": "c1", "hit": True},
+                    ],
+                    None,
+                ),
+                (0, [], None),
+                (0, [], None),
+            ]
+            with (
+                mock.patch.object(dw, "list_my_guilds", return_value=[]),
+                mock.patch.object(
+                    dw,
+                    "list_my_dms",
+                    return_value=[{"id": "c1", "type": 1, "recipients": []}],
+                ),
+                mock.patch.object(dw, "search_messages", side_effect=search_pages),
+                mock.patch.object(dw, "delete_message", side_effect=delete_returns),
+                mock.patch.object(dw.time, "sleep", side_effect=lambda s: sleeps.append(s)),
+            ):
+                dw.phase_live_catchup(sess, cfg)
+
+            # The collapse signature is a 1.0s post-mark sleep (max(1.0,0.2)).
+            # With the floor held at 1.7, both post-marks are 1.7.
+            post_marks = [s for s in sleeps if s not in (0.0,)]
+            self.assertFalse(
+                any(0.99 <= s <= 1.01 for s in post_marks),
+                f"floor collapsed to ~1.0 (404 hint overwrote 429 floor): {sleeps}",
+            )
+            self.assertGreaterEqual(
+                len([s for s in sleeps if abs(s - 1.7) < 1e-6]),
+                3,
+                f"expected 1 retry + 2 post-marks at 1.7s; got {sleeps}",
+            )
+
+    def test_smaller_429_still_relaxes_floor_down(self):
+        # Guard the v0.3.3 behaviour survives the clamp: a SMALLER 429
+        # must still pull the floor down (floor_429 is overwritten, not
+        # maxed, on every 429).
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            state = dw.State(tmp / "state.json")
+            cfg = _make_cfg(state, delete_delay=1.0)
+            sess = mock.MagicMock()
+
+            sleeps: list[float] = []
+            # m1: 429(2.3)->404(0.2); m2: 429(1.0)->404(0.2); m3: 404(0.2)
+            delete_returns = [
+                ("retry", 2.3),
+                ("gone", 0.2),
+                ("retry", 1.0),
+                ("gone", 0.2),
+                ("gone", 0.2),
+            ]
+            search_pages = [
+                (
+                    3,
+                    [
+                        {"id": "m1", "channel_id": "c1", "hit": True},
+                        {"id": "m2", "channel_id": "c1", "hit": True},
+                        {"id": "m3", "channel_id": "c1", "hit": True},
+                    ],
+                    None,
+                ),
+                (0, [], None),
+                (0, [], None),
+            ]
+            with (
+                mock.patch.object(dw, "list_my_guilds", return_value=[]),
+                mock.patch.object(
+                    dw,
+                    "list_my_dms",
+                    return_value=[{"id": "c1", "type": 1, "recipients": []}],
+                ),
+                mock.patch.object(dw, "search_messages", side_effect=search_pages),
+                mock.patch.object(dw, "delete_message", side_effect=delete_returns),
+                mock.patch.object(dw.time, "sleep", side_effect=lambda s: sleeps.append(s)),
+            ):
+                dw.phase_live_catchup(sess, cfg)
+
+            # After the smaller 1.0 retry, no sleep may exceed 1.0 (the
+            # floor relaxed down; the earlier 2.3 floor is gone).
+            idx = sleeps.index(1.0)
+            tail = [s for s in sleeps[idx + 1 :] if s > 0]
+            self.assertTrue(
+                all(s <= 1.0 + 1e-6 for s in tail),
+                f"floor failed to relax down after a smaller 429: {tail} (all={sleeps})",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

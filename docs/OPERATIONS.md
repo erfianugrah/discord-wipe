@@ -336,15 +336,35 @@ identity-change, or stopped. `docker logs` will say which.
 
 ### Corrupt state.json recovery
 
-If the script can't parse `state.json` on load (rare, but happens if
-the filesystem flushed mid-write or someone hand-edited and broke the
-JSON), it:
+**Durability (v0.4.3+).** `state.save()` now writes the temp file,
+`fsync`s it, rotates the previous good `state.json` to `state.json.bak`,
+atomically renames the new file into place, then `fsync`s the directory.
+On load the script tries `state.json` first and falls back to
+`state.json.bak` if the live file is missing, empty, or unparseable — so
+a single torn write loses at most the last ~10 deletes, not the whole
+set. This fixed the **0-byte truncation** failure that erased a
+107k-ID *completed* wipe twice on 2026-06-08: a plain rename without
+`fsync` is not crash-safe on Unraid's `/mnt/user` shfs FUSE overlay
+(the rename journals but the data pages may never flush when the
+container is SIGKILLed in the writeback window). See Bug12.
 
-1. Renames the bad file to `state.json.corrupt-YYYYMMDDTHHMMSSZ`.
-2. Prints a WARN line: `[state] WARN: ... is corrupt (...); moved to ...; starting fresh`.
+If the script *still* can't parse `state.json` on load AND the `.bak`
+is also unusable (both hand-broken, or a pre-0.4.3 0-byte file with no
+backup yet), it:
+
+1. Renames each unparseable file to `<name>.corrupt-YYYYMMDDTHHMMSSZ`.
+2. Prints a WARN line: `[state] WARN: ... is corrupt (...); moved to ...`.
 3. Resumes with empty state — every "forgotten" ID gets re-issued,
    hits Discord 404, is counted as `gone` and re-marked. Safe but
-   slow (~6h extra wall time on a 100K-message backlog).
+   slow (~4d wall time on a 100K-message backlog at the old-message
+   DELETE rate limit). The `.bak` fallback is what keeps this from
+   happening on a routine container kill.
+
+A `state.json.corrupt-*` file of **exactly 0 bytes** is the signature
+of the pre-0.4.3 no-`fsync` bug. On 0.4.3+ the `.bak` should have
+absorbed it — if you see fresh 0-byte corrupt files on 0.4.3+, the
+underlying disk is genuinely losing fsync'd writes (investigate the
+array / cache device).
 
 List backups:
 ```sh

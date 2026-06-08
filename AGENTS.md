@@ -13,7 +13,7 @@ older than `RETENTION_DAYS` (default 14). One file of Python (stdlib +
 Stack files live at `/mnt/user/composer/stacks/discord-wipe/` on `servarr`
 (composer-managed git clone); data (export RO, state RW) lives at
 `/mnt/user/discord-wipe/`. Image is published to `ghcr.io/erfianugrah/discord-wipe`.
-Current version: see `__version__` in `discord_wipe.py` (0.4.1 as of this commit).
+Current version: see `__version__` in `discord_wipe.py` (0.4.3 as of this commit).
 
 ## Hard safety rules (read these or break things)
 
@@ -106,6 +106,30 @@ instead of crashing, and a successful auth now resets `restart_burst` to
 `Bug10_TransientNetworkErrorIsRetriedNotFatal` (4) +
 `Bug11_SuccessfulAuthClearsRestartBurst` (1).
 
+v0.4.3 fixed the single worst failure mode this project has had: a
+**0-byte `state.json` truncation** that silently erased a *completed*
+wipe and forced a from-scratch re-grind. Observed live 2026-06-08: the
+daemon logged `(107025 IDs already done; export_consumed=True)`, then
+`state.json` went to 0 bytes, `_load()` saw `Expecting value: line 1
+column 1 (char 0)`, reset to empty, and re-issued DELETE on ~105k
+already-deleted messages — all returning `404 gone`, `ok=0`, paced at
+~16/min by Discord's punishing **old-message DELETE rate limit** (every
+single-message delete of a >14-day-old message hits a separate, much
+stricter bucket; this is a documented Discord behaviour, not a bug in
+this tool). Six 0-byte `state.json.corrupt-*` backups across 8 days were
+the fingerprint. Root cause: `state.save()` did `write_text()` +
+`rename()` with **no `fsync`**, which is not crash-safe on Unraid's
+`/mnt/user` shfs FUSE overlay — the rename metadata journals but the
+data pages may never flush when the container is SIGKILLed (stop-grace
+overrun / host reboot / OOM) inside the writeback window. Fix:
+`save()` now `fsync`s the temp file before the rename, rotates the
+previous good file to `state.json.bak`, and `fsync`s the parent
+directory after; `_load()` falls back to `.bak` when `state.json` is
+missing/empty/corrupt, so a torn write loses at most the last ~10
+deletes instead of the whole set. The relentless rate-limiting in the
+logs was a *symptom* — the real defect was re-deleting messages that
+were already gone. Tests: `Bug12_StateSurvivesZeroByteTruncation` (3).
+
 ## Repo layout
 
 ```
@@ -121,11 +145,12 @@ discord-wipe/
 ├── pyproject.toml         ruff config + project metadata
 ├── tests/
 │   ├── __init__.py
-│   └── test_discord_wipe.py  stdlib unittest, 38 tests across 22 classes:
+│   └── test_discord_wipe.py  stdlib unittest, 44 tests across 23 classes:
 │                             3 safety mandate (only-my-messages defence-
-│                             in-depth) + 13 regression (one per fixed bug,
-│                             plus the v0.3.0 anti-GC guards + the v0.4.1
-│                             transient-network + burst-reset fixes) + 16
+│                             in-depth) + regression (one per fixed bug,
+│                             plus the v0.3.0 anti-GC guards, the v0.4.1
+│                             transient-network + burst-reset fixes, and the
+│                             v0.4.3 Bug12 0-byte-state-durability guards) +
 │                             v0.4.0 feature tests (heartbeat, restart-burst,
 │                             state-unwritable, notify-on-park, metrics,
 │                             status subcommand)

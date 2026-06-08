@@ -58,7 +58,7 @@ import requests
 # Constants
 # ---------------------------------------------------------------------------
 
-__version__ = "0.4.2"  # bump on every behaviour change; tag releases as vX.Y.Z
+__version__ = "0.4.3"  # bump on every behaviour change; tag releases as vX.Y.Z
 
 API = "https://discord.com/api/v10"
 DISCORD_EPOCH_MS = 1420070400000  # 2015-01-01T00:00:00Z
@@ -174,56 +174,111 @@ class State:
         # Heartbeat path (next to state.json, also in the bind-mount).
         # HEALTHCHECK reads its mtime; state.save() touches it.
         self.heartbeat_path = self.path.with_name("heartbeat")
+        # Last-known-good snapshot. save() rotates the current good
+        # state.json here before swapping in the new one, and _load()
+        # falls back to it when state.json is missing/empty/corrupt. This
+        # is what makes a single bad write non-fatal (see Bug12).
+        self.backup_path = self.path.with_name(f"{self.path.name}.bak")
         self._load()
 
-    def _load(self) -> None:
-        if not self.path.exists():
-            return
+    def _quarantine_corrupt(self, candidate: pathlib.Path, err: Exception) -> None:
+        """Move an unparseable state file aside (auditable, not silent)."""
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = candidate.with_name(f"{candidate.name}.corrupt-{ts}")
         try:
-            d = json.loads(self.path.read_text())
-        except json.JSONDecodeError as e:
-            # Move the corrupt file aside so an operator can recover the
-            # set if it mattered. Starting fresh is safe — every ID we
-            # forget will be re-issued, hit 404, classified 'gone', and
-            # re-marked. Slower, not wrong. The backup makes this
-            # auditable rather than silent.
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            backup = self.path.with_name(f"{self.path.name}.corrupt-{ts}")
+            candidate.rename(backup)
+            print(
+                f"[state] WARN: {candidate} is corrupt ({err}); moved to {backup}",
+                file=sys.stderr,
+            )
+        except OSError as rename_err:
+            print(
+                f"[state] WARN: {candidate} is corrupt ({err}); could not back up ({rename_err})",
+                file=sys.stderr,
+            )
+
+    def _load(self) -> None:
+        # Try the live file first, then the last-known-good .bak. Any
+        # candidate that exists but won't parse — e.g. a 0-byte file left
+        # by a non-durable write on a prior version — is quarantined and
+        # we fall through. Starting fresh is safe but slow (every ID we
+        # forget is re-issued, 404s, is classified 'gone', and re-marked),
+        # so the .bak fallback exists to avoid that whenever possible.
+        for candidate, is_backup in ((self.path, False), (self.backup_path, True)):
+            if not candidate.exists():
+                continue
             try:
-                self.path.rename(backup)
+                raw = candidate.read_text()
+            except OSError:
+                continue
+            try:
+                d = json.loads(raw)
+            except json.JSONDecodeError as e:
+                self._quarantine_corrupt(candidate, e)
+                continue
+            self.deleted = set(d.get("deleted", []))
+            self.export_consumed = bool(d.get("export_consumed", False))
+            self.last_pass_at = d.get("last_pass_at")
+            self.last_started_at = d.get("last_started_at")
+            self.restart_burst = int(d.get("restart_burst", 0) or 0)
+            if is_backup:
                 print(
-                    f"[state] WARN: {self.path} is corrupt ({e}); "
-                    f"moved to {backup}; starting fresh",
-                    file=sys.stderr,
-                )
-            except OSError as rename_err:
-                print(
-                    f"[state] WARN: {self.path} is corrupt ({e}); "
-                    f"could not back up ({rename_err}); starting fresh",
+                    f"[state] recovered {len(self.deleted)} IDs from {candidate.name}; "
+                    f"live state.json was missing/empty/corrupt",
                     file=sys.stderr,
                 )
             return
-        self.deleted = set(d.get("deleted", []))
-        self.export_consumed = bool(d.get("export_consumed", False))
-        self.last_pass_at = d.get("last_pass_at")
-        self.last_started_at = d.get("last_started_at")
-        self.restart_burst = int(d.get("restart_burst", 0) or 0)
+        # Neither file usable — fresh start (deleted stays empty).
 
     def save(self) -> None:
+        """Durably persist state: atomic write + fsync + last-good backup.
+
+        A plain write_text()+rename is NOT crash-safe on Unraid's
+        /mnt/user shfs FUSE overlay. The rename metadata journals but the
+        data pages may never flush if the container is SIGKILLed (stop-
+        grace overrun, host reboot, OOM) inside the writeback window,
+        leaving a 0-byte state.json. That exact failure erased a
+        107k-ID *completed* wipe twice on 2026-06-08, forcing a from-
+        scratch re-grind of ~105k already-deleted messages against the
+        punishing old-message DELETE rate limit (~16/min). See Bug12.
+
+        Durability recipe:
+          1. write tmp, flush, fsync(fd)        -> data is on disk
+          2. rotate current good state.json -> .bak (atomic rename)
+          3. rename tmp -> state.json           (atomic)
+          4. fsync the parent directory         -> the renames are durable
+        _load() falls back to .bak when state.json is missing/empty/
+        corrupt, so even a torn write loses at most the last increment.
+        """
         tmp = self.path.with_suffix(".json.tmp")
+        payload = json.dumps(
+            {
+                "deleted": sorted(self.deleted),
+                "export_consumed": self.export_consumed,
+                "last_pass_at": self.last_pass_at,
+                "last_started_at": self.last_started_at,
+                "restart_burst": self.restart_burst,
+            }
+        )
         try:
-            tmp.write_text(
-                json.dumps(
-                    {
-                        "deleted": sorted(self.deleted),
-                        "export_consumed": self.export_consumed,
-                        "last_pass_at": self.last_pass_at,
-                        "last_started_at": self.last_started_at,
-                        "restart_burst": self.restart_burst,
-                    }
-                )
-            )
-            tmp.replace(self.path)
+            with open(tmp, "w") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            # Rotate the previous good copy to .bak (atomic, metadata-only
+            # — no data copy) before swapping in the new one.
+            if self.path.exists():
+                with contextlib.suppress(OSError):
+                    os.replace(self.path, self.backup_path)
+            os.replace(tmp, self.path)
+            # Commit the rename(s) themselves so a crash can't resurrect
+            # the old directory entry pointing at freed/zero data.
+            with contextlib.suppress(OSError):
+                dfd = os.open(self.path.parent, os.O_DIRECTORY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
         except OSError as e:
             raise StateUnwritableError(f"could not write state file {self.path}: {e}") from e
         # Heartbeat: a separate file whose mtime is what the HEALTHCHECK
@@ -868,7 +923,19 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
         # to 0.0 per message, which caused a 404-heavy stream (e.g.
         # re-running a wipe whose state was lost) to cycle
         # 429→retry→404→floor→429 forever at ~18/min.
+        #
+        # floor_429 (v0.4.3) is the stickier of the two: the freshest
+        # 429 retry_after. A clean 204/404 carries the NORMAL per-channel
+        # delete bucket headers (which have plenty of headroom → a tiny
+        # hint), but the 429s we actually hit come from Discord's SEPARATE,
+        # stricter old-message (>14d) delete sub-limit. Letting the small
+        # normal-bucket hint overwrite extra_sleep collapsed the pace back
+        # to ~delete_delay, so the very next delete re-tripped the old-msg
+        # limit — a 429 on EVERY message (~16/min, observed live
+        # 2026-06-08). Clamping clean hints to >= floor_429 keeps the pace
+        # at the old-msg interval so we stop storming 429s.
         extra_sleep = 0.0
+        floor_429 = 0.0
         for j, mid in enumerate(targets, 1):
             if STOP:
                 break
@@ -898,20 +965,23 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
                     # at 2.3s forever even when subsequent 429s reported
                     # the bucket had relaxed to 1.0s. Observed cost in
                     # 2026-05-28 v0.3.2 deploy: ~10/min throughput loss.
+                    # floor_429 tracks the same value but is sticky across
+                    # clean responses (see below); a smaller 429 relaxes
+                    # both, preserving the v0.3.3 relax-down behaviour.
                     extra_sleep = hint
+                    floor_429 = hint
                     time.sleep(hint)
                     if STOP:
                         break
                     continue
                 if status in ("ok", "gone") and hint > 0:
-                    # Header-derived pacing refreshes the floor when we
-                    # have valid bucket info — may be smaller than the
-                    # stale 429-derived floor if the bucket has refilled.
-                    # When hint == 0 (no rate-limit headers on this
-                    # response — Discord doesn't always include them on
-                    # 404), KEEP the prior floor so a 429-derived floor
-                    # is not erased by a header-less 404.
-                    extra_sleep = hint
+                    # Header-derived pacing CAN relax the floor when the
+                    # normal bucket has refilled, but never below the
+                    # freshest old-message 429 interval — otherwise the
+                    # next delete re-trips the old-msg sub-limit and we
+                    # 429 on every message. When hint == 0 (no headers on
+                    # this response) KEEP the prior floor.
+                    extra_sleep = max(hint, floor_429)
                 break
 
             if status == "retry":
@@ -1004,9 +1074,11 @@ def phase_live_catchup(s: requests.Session, cfg: WipeConfig) -> None:
 
         # extra_sleep is hoisted to scope-level so the pacing floor
         # survives across pages within a scope. See phase_export for
-        # the full rationale. Reset per-scope because Discord may
-        # bucket scopes independently.
+        # the full rationale (incl. the v0.4.3 floor_429 clamp that
+        # stops the old-message sub-limit from 429ing every message).
+        # Reset per-scope because Discord may bucket scopes independently.
         extra_sleep = 0.0
+        floor_429 = 0.0
         # Loop: search → delete → wait for index → repeat. Empty page ends scope.
         empty_streak = 0
         while not STOP:
@@ -1067,16 +1139,19 @@ def phase_live_catchup(s: requests.Session, cfg: WipeConfig) -> None:
                         print(f"    rate-limited; sleep {hint:.1f}s")
                         # Overwrite, not max — see phase_export for the
                         # v0.3.2→v0.3.3 rationale (max trapped the floor
-                        # at historical high-water mark).
+                        # at historical high-water mark). floor_429 is the
+                        # sticky old-msg interval clean hints can't undercut.
                         extra_sleep = hint
+                        floor_429 = hint
                         time.sleep(hint)
                         if STOP:
                             break
                         continue
                     if status in ("ok", "gone") and hint > 0:
-                        # See phase_export for why hint > 0 matters —
-                        # a header-less 404 must NOT erase a 429 floor.
-                        extra_sleep = hint
+                        # Relax toward the normal bucket but never below
+                        # the freshest old-message 429 interval — see
+                        # phase_export. hint == 0 keeps the prior floor.
+                        extra_sleep = max(hint, floor_429)
                     break
 
                 if status == "retry":
@@ -1192,6 +1267,88 @@ def cmd_status(args) -> int:
     if n_deleted:
         sample = sorted(d.get("deleted", []))[:3]
         print(f"sample IDs:       {sample}")
+    return 0
+
+
+def cmd_seed_from_export(args) -> int:
+    """Mark every export message OLDER than the cutoff as already-deleted.
+
+    Recovery / fast-forward tool — no Discord API calls, purely local.
+
+    After a state loss (e.g. the pre-0.4.3 0-byte `state.json`
+    truncation), a from-scratch `run` re-issues DELETE on every message
+    in the export. If a prior pass already deleted them, each one comes
+    back 404 'gone' — but Discord still bills it against the punishing
+    old-message (>14d) delete rate limit (~16/min, ETA days for a 100k
+    backlog). When you KNOW a previous run completed the wipe, this
+    seeds `state.deleted` with the export's old-message IDs and flips
+    `export_consumed=True`, so the daemon skips that pointless re-grind.
+
+    Safety: only messages strictly OLDER than the cutoff are seeded;
+    anything newer stays unmarked, so the live catchup phase still
+    deletes it once it ages past retention. This tool does NOT verify
+    the messages are actually gone — only run it when you're confident a
+    prior pass deleted them (e.g. the logs showed a completed wipe
+    before the state was lost). The existing deleted set + restart
+    counters are preserved (union, not replace).
+    """
+    state = State(args.state)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=args.retention_days)
+    before = len(state.deleted)
+    print(
+        f"[seed] state={args.state}: {before} IDs already marked, "
+        f"export_consumed={state.export_consumed}"
+    )
+    print(f"[seed] cutoff={cutoff.isoformat()} (retention={args.retention_days}d)")
+
+    channels = read_export(args.export_dir)
+    print(f"[seed] {len(channels)} channels in export")
+
+    seeded = 0
+    skipped_recent = 0
+    channels_seen = 0
+    for ch in channels:
+        try:
+            msgs = json.loads(ch.msgs_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            print(f"[seed] {ch.id}: skip ({e})", file=sys.stderr)
+            continue
+        channels_seen += 1
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            try:
+                mid = str(m["ID"])
+            except (KeyError, TypeError):
+                continue
+            ts_raw = m.get("Timestamp")
+            old = True
+            if ts_raw is not None:
+                try:
+                    # Same rule phase_export uses: a parseable timestamp
+                    # >= cutoff is 'recent' and must NOT be seeded; an
+                    # unparseable one is treated as a delete target (old).
+                    old = parse_export_ts(ts_raw) < cutoff
+                except Exception:
+                    old = True
+            if not old:
+                skipped_recent += 1
+                continue
+            if mid not in state.deleted:
+                state.mark(mid)
+                seeded += 1
+
+    state.export_consumed = True
+    state.save()
+    print(
+        f"[seed] channels={channels_seen}; seeded {seeded} new IDs "
+        f"(was {before:,}, now {len(state.deleted):,}); "
+        f"left {skipped_recent:,} recent (>= cutoff) unmarked; export_consumed=True"
+    )
+    print(
+        "[seed] done — the next pass skips the export grind; live catchup "
+        "still deletes anything that has since aged past retention."
+    )
     return 0
 
 
@@ -1508,6 +1665,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--state", type=pathlib.Path, default=DEFAULT_STATE)
     p.set_defaults(func=cmd_status)
 
+    p = sub.add_parser(
+        "seed-from-export",
+        help="mark export messages older than the cutoff as already-deleted "
+        "and set export_consumed=True (recovery; no API calls)",
+    )
+    p.add_argument("--export-dir", type=pathlib.Path, default=DEFAULT_EXPORT)
+    p.add_argument("--state", type=pathlib.Path, default=DEFAULT_STATE)
+    p.add_argument(
+        "--retention-days",
+        type=float,
+        default=float(os.environ.get("RETENTION_DAYS", "14")),
+        help="messages older than this are seeded as deleted (default 14, env RETENTION_DAYS)",
+    )
+    p.set_defaults(func=cmd_seed_from_export)
+
     p = sub.add_parser("run", help="run wipe pass(es)")
     p.add_argument("--export-dir", type=pathlib.Path, default=DEFAULT_EXPORT)
     p.add_argument("--state", type=pathlib.Path, default=DEFAULT_STATE)
@@ -1554,8 +1726,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    # `status` is the only token-less subcommand — it only reads state.json.
-    if args.cmd != "status" and not args.token:
+    # `status` and `seed-from-export` are the token-less subcommands — they
+    # only touch local files (state.json + the export), never Discord.
+    if args.cmd not in ("status", "seed-from-export") and not args.token:
         print("ERROR: no token. Set DISCORD_TOKEN env var or pass --token.", file=sys.stderr)
         return 2
     return args.func(args)
