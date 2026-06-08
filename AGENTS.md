@@ -248,17 +248,50 @@ just `docker compose pull && docker compose up -d`. Token lives in
   `:sha-<short>`.
 - `v*` tag push → same workflow also tags `:v1.2.3`, `:1.2`, `:1`, and
   `:latest`.
-- Composer is meant to subscribe to the `:main` tag via its webhook
-  listener and pull + redeploy on push. **In practice this has been
-  flaky** for this stack (verified 2026-05-28 against v0.3.0 + v0.3.1):
-  the new tag landed on ghcr but composer didn't auto-pull either time.
-  Manual redeploy workaround:
+- Composer git-syncs this stack from the repo (`auto_sync: true`,
+  remote `git@github.com:erfianugrah/discord-wipe.git`, SSH via the
+  encrypted `id_gh_wsl` key at `/home/composer/.ssh/`). On a healthy
+  clone, a `main` push auto-pulls `compose.yaml`/`.env` and redeploys.
+
+- **2026-05-28 → 2026-06-08 this was stuck, and the cause was NOT
+  "flaky composer" / a broken SSH key** (an earlier note here blamed
+  both — wrong). The clone's local `main` was pinned to an ORPHANED
+  commit (`25d5197`) left behind by a history rewrite, so it was not
+  an ancestor of `origin/main`. composer's go-git pull only
+  fast-forwards, so every sync errored with `non-fast-forward update`
+  and the clone never advanced — which is why every deploy back then
+  needed a manual redeploy. SSH auth was fine the whole time.
+
+- **Diagnosing composer git-sync** (do NOT test as `root` — composer
+  runs as the `composer` user, and its key is encrypted at rest so raw
+  `ssh -T git@github.com` / `git fetch` always fail regardless of
+  user; that proves nothing). Ask composer instead:
+  ```sh
+  curl -s -H "X-API-Key: $COMPOSER_API_KEY" \
+    https://composer.erfi.io/api/v1/stacks/discord-wipe/git/status | jq
+  # sync_status: "synced" = healthy; "error" = read the message
+  ```
+
+- **Fix for a diverged / non-fast-forward clone** — reconcile to the
+  already-fetched origin ref (no network needed; discards orphaned
+  local commits + dirty tracked files, both superseded by origin;
+  untracked `.env` is preserved), then re-sync via the API:
+  ```sh
+  ssh servarr 'D=/mnt/user/composer/stacks/discord-wipe; \
+    git config --global --add safe.directory "$D"; \
+    git -C "$D" reset --hard refs/remotes/origin/main'
+  curl -s -X POST -H "X-API-Key: $COMPOSER_API_KEY" \
+    https://composer.erfi.io/api/v1/stacks/discord-wipe/sync   # "Git pull + detect changes"
+  ```
+
+- **Manual image-only redeploy** (when you just want the latest `:main`
+  image without touching git) — note the in-container stack path is
+  `/opt/stacks/discord-wipe/`, NOT the host's
+  `/mnt/user/composer/stacks/discord-wipe/`, because composer runs
+  `docker compose` from inside its own container:
   ```sh
   ssh servarr 'docker exec composer sh -c "cd /opt/stacks/discord-wipe && docker compose pull && docker compose up -d"'
   ```
-  Note the in-container stack path is `/opt/stacks/discord-wipe/`,
-  NOT the host's `/mnt/user/composer/stacks/discord-wipe/` — composer
-  runs `docker compose` from inside its own container.
 
 Verify a build via `gh run list --workflow=release.yml` or
 `oci_tags ghcr.io/erfianugrah/discord-wipe`. Verify the running image
