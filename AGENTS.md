@@ -318,13 +318,56 @@ just `docker compose pull && docker compose up -d`. Token lives in
   then re-sync.)
 
 - **Manual image-only redeploy** (when you just want the latest `:main`
-  image without touching git) — note the in-container stack path is
-  `/opt/stacks/discord-wipe/`, NOT the host's
+  image without touching git) — prefer the composer API, which injects
+  env + recreates: `POST /api/v1/stacks/discord-wipe/{pull,up}` (see the
+  `.env` footgun below before running `up`). The lower-level path is
+  `docker exec composer sh -c "cd /opt/stacks/discord-wipe && docker
+  compose pull && docker compose up -d"` — note the in-container stack
+  path is `/opt/stacks/discord-wipe/`, NOT the host's
   `/mnt/user/composer/stacks/discord-wipe/`, because composer runs
-  `docker compose` from inside its own container:
+  `docker compose` from inside its own container.
+
+- **The `.env` is load-bearing AND fragile — restore it server-side, not
+  from your context.** `compose.yaml` declares `env_file: .env`, and
+  composer stores NO env vars for this stack (`GET /api/v1/stacks/
+  discord-wipe` → `has_env: 0`). So the on-disk `.env` (just
+  `DISCORD_TOKEN=...`) is the ONLY source of the token. It is gitignored,
+  so a clone re-sync / re-clone during a recovery event can delete it —
+  after which EVERY composer `up` (and the lower-level `docker compose
+  up`) 500s with `env file /opt/stacks/discord-wipe/.env not found`,
+  even though the running container keeps working (its env is baked in at
+  create time and survives `docker start`). Observed 2026-06-08. Recover
+  WITHOUT the token entering the agent's context by piping it out of the
+  still-running container into the file on the host:
   ```sh
-  ssh servarr 'docker exec composer sh -c "cd /opt/stacks/discord-wipe && docker compose pull && docker compose up -d"'
+  ssh servarr 'ENV=/mnt/user/composer/stacks/discord-wipe/.env; \
+    docker exec discord-wipe printenv DISCORD_TOKEN \
+      | { IFS= read -r t; printf "DISCORD_TOKEN=%s\n" "$t"; } > "$ENV"; \
+    chmod 600 "$ENV"; chown 99:101 "$ENV"'   # owner 99:101 matches the clone
   ```
+  Verify without printing the secret: `wc -l`, `head -c 14` (shows the
+  `DISCORD_TOKEN=` prefix only), `stat -c %s` (~85 bytes for a valid
+  user token), and a `grep -q replace-me` placeholder check.
+
+- **Recover a state-loss without a 4-day re-grind:** `seed-from-export`
+  (v0.4.3+) marks every export message older than the cutoff as deleted
+  and sets `export_consumed=True`, so the daemon skips re-issuing DELETE
+  on already-gone messages. Token-less, no API calls. Stop the container
+  first so the save isn't raced, run it as a one-off against the same
+  mounts, then bring the daemon back:
+  ```sh
+  ssh servarr 'docker stop discord-wipe; \
+    docker run --rm \
+      -v /mnt/user/discord-wipe/export:/data/export:ro \
+      -v /mnt/user/discord-wipe/state:/data/state \
+      ghcr.io/erfianugrah/discord-wipe:main \
+      seed-from-export --retention-days 14'
+  # then composer up (after the .env exists) to start the daemon on the seed
+  ```
+  Only messages OLDER than the cutoff are seeded; recent ones stay
+  unmarked so live catchup still deletes them when they age out. It does
+  NOT verify the messages are gone — only run it when a prior pass is
+  known to have completed the wipe.
 
 Verify a build via `gh run list --workflow=release.yml` or
 `oci_tags ghcr.io/erfianugrah/discord-wipe`. Verify the running image
