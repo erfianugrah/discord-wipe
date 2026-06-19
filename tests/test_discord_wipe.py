@@ -1274,5 +1274,127 @@ class Bug13_404HintDoesNotCollapse429Floor(unittest.TestCase):
             )
 
 
+class PurgeSubcommand(unittest.TestCase):
+    """Tests for the `purge` subcommand (cmd_purge + phase_live_catchup
+    targets_override path).
+
+    Added alongside the v0.5.0 `purge` subcommand that lets the user wipe
+    messages from a specific guild or channel without touching the rest of
+    their account.
+    """
+
+    def test_purge_no_targets_returns_error(self):
+        """purge with no --guild and no --channel must fail with exit code 2
+        rather than silently wiping the whole account."""
+        args = argparse.Namespace(
+            cmd="purge",
+            token="fake-token",
+            guild=[],
+            channel=[],
+            retention_days=0.0,
+            delete_delay=1.0,
+            search_delay=0.0,
+            dry_run=False,
+            state=pathlib.Path("/tmp/no-state.json"),
+        )
+        rc = dw.cmd_purge(args)
+        self.assertEqual(rc, 2)
+
+    def test_purge_guild_passes_targets_override(self):
+        """purge --guild ID calls phase_live_catchup with targets_override
+        containing exactly that guild scope and skips guild/DM enumeration."""
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            captured: dict = {}
+
+            def fake_catchup(s, cfg, targets_override=None):
+                captured["targets"] = targets_override
+
+            args = argparse.Namespace(
+                cmd="purge",
+                token="fake-token",
+                guild=["111222333444555666"],
+                channel=[],
+                retention_days=0.0,
+                delete_delay=0.0,
+                search_delay=0.0,
+                dry_run=False,
+                state=tmp / "state.json",
+            )
+            with (
+                mock.patch.object(dw, "get_me", return_value={"id": "self-id", "username": "test"}),
+                mock.patch.object(dw, "phase_live_catchup", side_effect=fake_catchup),
+            ):
+                rc = dw.cmd_purge(args)
+
+            self.assertEqual(rc, 0)
+            self.assertIsNotNone(captured.get("targets"), "targets_override was not passed")
+            self.assertEqual(len(captured["targets"]), 1)
+            scope, scope_id, label = captured["targets"][0]
+            self.assertEqual(scope, "guild")
+            self.assertEqual(scope_id, "111222333444555666")
+            self.assertIn("111222333444555666", label)
+
+    def test_purge_targets_override_skips_enumeration(self):
+        """When targets_override is supplied, phase_live_catchup must NOT
+        call list_my_guilds or list_my_dms."""
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            state = dw.State(tmp / "state.json")
+            cfg = _make_cfg(state)
+            sess = mock.MagicMock()
+
+            targets_in = [("guild", "GUILD1", "guild:GUILD1")]
+
+            with (
+                mock.patch.object(dw, "list_my_guilds") as mock_guilds,
+                mock.patch.object(dw, "list_my_dms") as mock_dms,
+                mock.patch.object(
+                    dw, "search_messages", return_value=(0, [], None)
+                ),
+            ):
+                dw.phase_live_catchup(sess, cfg, targets_override=targets_in)
+
+            mock_guilds.assert_not_called()
+            mock_dms.assert_not_called()
+
+    def test_purge_multi_target(self):
+        """Two --guild flags and one --channel flag produce three entries in
+        targets_override in the declared order."""
+        _reset_stop()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            captured: dict = {}
+
+            def fake_catchup(s, cfg, targets_override=None):
+                captured["targets"] = targets_override
+
+            args = argparse.Namespace(
+                cmd="purge",
+                token="fake-token",
+                guild=["G1", "G2"],
+                channel=["C1"],
+                retention_days=0.0,
+                delete_delay=0.0,
+                search_delay=0.0,
+                dry_run=True,
+                state=tmp / "state.json",
+            )
+            with (
+                mock.patch.object(dw, "get_me", return_value={"id": "self-id", "username": "test"}),
+                mock.patch.object(dw, "phase_live_catchup", side_effect=fake_catchup),
+            ):
+                rc = dw.cmd_purge(args)
+
+            self.assertEqual(rc, 0)
+            scopes = [(s, sid) for s, sid, _ in captured["targets"]]
+            self.assertEqual(
+                scopes,
+                [("guild", "G1"), ("guild", "G2"), ("channel", "C1")],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

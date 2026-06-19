@@ -58,7 +58,7 @@ import requests
 # Constants
 # ---------------------------------------------------------------------------
 
-__version__ = "0.4.3"  # bump on every behaviour change; tag releases as vX.Y.Z
+__version__ = "0.5.0"  # bump on every behaviour change; tag releases as vX.Y.Z
 
 API = "https://discord.com/api/v10"
 DISCORD_EPOCH_MS = 1420070400000  # 2015-01-01T00:00:00Z
@@ -1039,33 +1039,49 @@ def phase_export(s: requests.Session, cfg: WipeConfig, export_dir: pathlib.Path)
     print(f"[export] done: {counters}")
 
 
-def phase_live_catchup(s: requests.Session, cfg: WipeConfig) -> None:
-    """Search-API sweep across every live guild + open DM."""
+def phase_live_catchup(
+    s: requests.Session,
+    cfg: WipeConfig,
+    targets_override: list[tuple[str, str, str]] | None = None,
+) -> None:
+    """Search-API sweep across every live guild + open DM.
+
+    When *targets_override* is provided the guild/DM enumeration is
+    skipped entirely and the caller's target list is used directly.
+    Each entry is ``(scope, scope_id, label)`` where *scope* is
+    ``'guild'`` or ``'channel'``.
+    """
     cutoff_snowflake = snowflake_at(cfg.cutoff)
 
-    guilds = list_my_guilds(s)
-    dms = list_my_dms(s)
-    print(
-        f"[catchup] {len(guilds)} guilds, {len(dms)} DM channels; "
-        f"cutoff={cfg.cutoff.isoformat()} (snowflake={cutoff_snowflake})"
-    )
+    if targets_override is not None:
+        targets: list[tuple[str, str, str]] = targets_override
+        print(
+            f"[catchup] {len(targets)} targeted scope(s); "
+            f"cutoff={cfg.cutoff.isoformat()} (snowflake={cutoff_snowflake})"
+        )
+    else:
+        guilds = list_my_guilds(s)
+        dms = list_my_dms(s)
+        print(
+            f"[catchup] {len(guilds)} guilds, {len(dms)} DM channels; "
+            f"cutoff={cfg.cutoff.isoformat()} (snowflake={cutoff_snowflake})"
+        )
+        targets = []
+        for g in guilds:
+            if g["id"] in cfg.exclude_guilds:
+                print(f"[catchup] skip excluded guild {g['id']} ({g.get('name')})")
+                continue
+            targets.append(("guild", g["id"], f"guild:{g.get('name', g['id'])}"))
+        for c in dms:
+            if c["id"] in cfg.exclude_channels:
+                print(f"[catchup] skip excluded channel {c['id']}")
+                continue
+            kind = c.get("type")
+            # 1=DM, 3=GROUP_DM
+            label = f"dm:{c['id']}" if kind == 1 else f"groupdm:{c['id']}"
+            targets.append(("channel", c["id"], label))
 
     counters = {"ok": 0, "gone": 0, "forbidden": 0}
-
-    targets: list[tuple[str, str, str]] = []  # (scope, scope_id, label)
-    for g in guilds:
-        if g["id"] in cfg.exclude_guilds:
-            print(f"[catchup] skip excluded guild {g['id']} ({g.get('name')})")
-            continue
-        targets.append(("guild", g["id"], f"guild:{g.get('name', g['id'])}"))
-    for c in dms:
-        if c["id"] in cfg.exclude_channels:
-            print(f"[catchup] skip excluded channel {c['id']}")
-            continue
-        kind = c.get("type")
-        # 1=DM, 3=GROUP_DM
-        label = f"dm:{c['id']}" if kind == 1 else f"groupdm:{c['id']}"
-        targets.append(("channel", c["id"], label))
 
     for ti, (scope, scope_id, label) in enumerate(targets, 1):
         if STOP:
@@ -1635,6 +1651,108 @@ def cmd_run(args) -> int:
                 last_heartbeat = time.time()
 
 
+def cmd_purge(args) -> int:
+    """One-shot targeted wipe — delete all your messages in specific guilds/channels.
+
+    Unlike ``run``, this command:
+    - Requires explicit ``--guild`` / ``--channel`` targets (no accidental
+      full-account wipe).
+    - Defaults ``--retention-days`` to **0** so ALL messages (including recent
+      ones) in the target scope are deleted.
+    - Skips the export phase entirely; only the live search-API sweep runs.
+    - Never loops (``--watch`` is not available).
+
+    Examples::
+
+        # Delete everything you ever posted in server 123456789012345678
+        discord-wipe purge --guild 123456789012345678
+
+        # Dry-run first — see what would be deleted
+        discord-wipe purge --guild 123456789012345678 --dry-run
+
+        # Wipe two servers at once
+        discord-wipe purge --guild 111 --guild 222
+
+        # Wipe a single channel/DM thread
+        discord-wipe purge --channel 987654321098765432
+
+        # Keep messages newer than 7 days
+        discord-wipe purge --guild 123456789012345678 --retention-days 7
+    """
+    install_signal_handlers()
+    print(f"[purge] discord-wipe v{__version__}")
+
+    guilds: list[str] = args.guild or []
+    channels: list[str] = args.channel or []
+    if not guilds and not channels:
+        print(
+            "ERROR: specify at least one --guild GUILD_ID or --channel CHANNEL_ID",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        state = State(args.state)
+    except StateUnwritableError as e:
+        return _state_unwritable_exit(str(e))
+
+    s = make_session(args.token)
+    try:
+        me = get_me(s)
+    except AuthError as e:
+        return _auth_paused_exit(_token_hint(args.token), str(e))
+    print(f"[purge] authenticated as @{me.get('username')} (id={me['id']})")
+    print(
+        f"[purge] state: {args.state} ({len(state.deleted)} IDs already done; "
+        f"export_consumed={state.export_consumed})"
+    )
+
+    # retention_days=0 → cutoff=now → delete everything in scope
+    cutoff = datetime.now(timezone.utc) - timedelta(days=args.retention_days)
+    cfg = WipeConfig(
+        token=args.token,
+        me_id=me["id"],
+        state=state,
+        cutoff=cutoff,
+        delete_delay=args.delete_delay,
+        search_delay=args.search_delay,
+        dry_run=args.dry_run,
+        exclude_guilds=set(),
+        exclude_channels=set(),
+    )
+
+    targets: list[tuple[str, str, str]] = []
+    for gid in guilds:
+        targets.append(("guild", gid, f"guild:{gid}"))
+    for cid in channels:
+        targets.append(("channel", cid, f"channel:{cid}"))
+
+    print(
+        f"[purge] targets: {[label for _, _, label in targets]}\n"
+        f"[purge] cutoff: {cutoff.isoformat()} "
+        f"(retention_days={args.retention_days})" + (" — DRY RUN" if args.dry_run else "")
+    )
+
+    t0 = time.time()
+    try:
+        phase_live_catchup(s, cfg, targets_override=targets)
+    except AuthError as e:
+        return _auth_paused_exit(_token_hint(args.token), str(e))
+    except StateUnwritableError as e:
+        return _state_unwritable_exit(str(e))
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        print(f"[purge] network error (outage outlasted retries): {e}", file=sys.stderr)
+
+    state.last_pass_at = datetime.now(timezone.utc).isoformat()
+    try:
+        state.save()
+    except StateUnwritableError as e:
+        return _state_unwritable_exit(str(e))
+    elapsed = time.time() - t0
+    print(f"[purge] === done in {_format_duration(elapsed)} ({elapsed:.0f}s) ===")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1720,6 +1838,49 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exclude-guild", action="append", help="guild ID to skip (repeatable)")
     p.add_argument("--exclude-channel", action="append", help="channel/DM ID to skip (repeatable)")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser(
+        "purge",
+        help="one-shot targeted wipe: delete all your messages in specific guilds/channels",
+        description=(
+            "Delete all your messages in one or more servers or channels without "
+            "touching the rest of your account. Retention defaults to 0 — "
+            "everything in the target scope is deleted regardless of age."
+        ),
+    )
+    p.add_argument(
+        "--guild",
+        action="append",
+        metavar="GUILD_ID",
+        help="server (guild) to wipe your messages from (repeatable)",
+    )
+    p.add_argument(
+        "--channel",
+        action="append",
+        metavar="CHANNEL_ID",
+        help="channel or DM thread to wipe (repeatable)",
+    )
+    p.add_argument("--state", type=pathlib.Path, default=DEFAULT_STATE)
+    p.add_argument(
+        "--retention-days",
+        type=float,
+        default=0.0,
+        help="only delete messages older than this many days (default 0 = delete all)",
+    )
+    p.add_argument(
+        "--delete-delay",
+        type=float,
+        default=float(os.environ.get("DELETE_DELAY", "1.0")),
+        help="seconds between DELETE calls (default 1.0, env DELETE_DELAY)",
+    )
+    p.add_argument(
+        "--search-delay",
+        type=float,
+        default=float(os.environ.get("SEARCH_DELAY", "15.0")),
+        help="seconds between search-page fetches (default 15.0, env SEARCH_DELAY)",
+    )
+    p.add_argument("--dry-run", action="store_true", help="report without deleting")
+    p.set_defaults(func=cmd_purge)
 
     return ap.parse_args()
 
