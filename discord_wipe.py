@@ -33,7 +33,12 @@ DISCORD_TOKEN env var or --token flag. NEVER commit it.
 Subcommands:
   verify    POST /users/@me — confirms the token works.
   discover  Show live guilds, open DMs, and export channel counts.
-  run       The actual wipe loop. --watch keeps it running forever.
+  search    Search your messages with optional content filter and preview
+            channel + timestamp + content before deciding to delete.
+  purge     One-shot targeted wipe of specific guilds/channels.
+  run       The rolling-retention wipe loop. --watch keeps it running forever.
+  status    Read state.json and print a summary (no API calls).
+  seed-from-export  Rebuild state.deleted from the export (recovery; no API).
 """
 
 from __future__ import annotations
@@ -58,7 +63,7 @@ import requests
 # Constants
 # ---------------------------------------------------------------------------
 
-__version__ = "0.5.0"  # bump on every behaviour change; tag releases as vX.Y.Z
+__version__ = "0.6.0"  # bump on every behaviour change; tag releases as vX.Y.Z
 
 API = "https://discord.com/api/v10"
 DISCORD_EPOCH_MS = 1420070400000  # 2015-01-01T00:00:00Z
@@ -586,25 +591,41 @@ def search_messages(
     scope: str,  # "guild" or "channel"
     scope_id: str,
     author_id: str,
-    max_id: int,
+    max_id: int = 0,
+    min_id: int = 0,
     offset: int = 0,
+    content: Optional[str] = None,
+    channel_id: Optional[str] = None,
 ) -> tuple[Optional[int], list[dict], Optional[float]]:
     """Search returning (total_results, hit_messages, retry_after_secs).
 
     On 429, returns (None, [], retry_after). On 403/404, returns (-1, [], None) — caller skips scope.
     Otherwise raises on hard errors.
+
+    Optional params:
+      content:     text to search for (Discord's undocumented content filter)
+      channel_id:  limit guild search to a specific channel
+      min_id:      snowflake lower bound (messages after this)
+      max_id:      snowflake upper bound (messages before this; default 0 = unbounded)
     """
     if scope == "guild":
         url = f"{API}/guilds/{scope_id}/messages/search"
     else:
         url = f"{API}/channels/{scope_id}/messages/search"
 
-    params = {
+    params: dict[str, str] = {
         "author_id": author_id,
-        "max_id": str(max_id),
-        "offset": offset,
+        "offset": str(offset),
         "include_nsfw": "true",
     }
+    if max_id:
+        params["max_id"] = str(max_id)
+    if min_id:
+        params["min_id"] = str(min_id)
+    if content:
+        params["content"] = content
+    if channel_id and scope == "guild":
+        params["channel_id"] = channel_id
     r = _request(s, "GET", url, params=params, timeout=60)
     _check_auth(r)
 
@@ -1758,6 +1779,230 @@ def cmd_purge(args) -> int:
 # ---------------------------------------------------------------------------
 
 
+def cmd_search(args) -> int:
+    """Search your messages across servers/DMs and preview what you'd delete.
+
+    Designed as the discovery step before ``purge`` — search for messages
+    matching a keyword (or just browse recent history), see channel + timestamp
+    + content preview, then decide whether to nuke the scope.
+
+    Examples::
+
+        # Find messages containing "bad phrase" in a server
+        discord-wipe search --guild 123456789 --content "bad phrase"
+
+        # Browse recent messages in a DM
+        discord-wipe search --channel 987654321
+
+        # Search everywhere for a keyword
+        discord-wipe search --content "old project name"
+
+        # Narrow by date range
+        discord-wipe search --guild 123456789 --before 2024-06-01 --after 2024-01-01
+    """
+    install_signal_handlers()
+    s = make_session(args.token)
+    try:
+        me = get_me(s)
+    except AuthError as e:
+        print(f"FAIL — {e}", file=sys.stderr)
+        return 2
+
+    guilds: list[str] = args.guild or []
+    channels: list[str] = args.channel or []
+
+    # Build search scope list: (scope_type, scope_id, label, channel_filter)
+    scopes: list[tuple[str, str, str, Optional[str]]] = []
+
+    if channels or guilds:
+        # Resolve DM recipient names for channel scopes
+        dms: dict[str, dict] = {}
+        if channels:
+            try:
+                dms = {c["id"]: c for c in list_my_dms(s)}
+            except Exception:
+                pass
+        for cid in channels:
+            dm = dms.get(cid)
+            if dm:
+                recips = ",".join(r.get("username", "?") for r in dm.get("recipients", []))
+                label = f"DM:{recips}"
+            else:
+                label = f"channel:{cid}"
+            scopes.append(("channel", cid, label, None))
+        for gid in guilds:
+            try:
+                r = _request(s, "GET", f"{API}/guilds/{gid}", timeout=10)
+                r.raise_for_status()
+                gname = r.json().get("name", gid)
+            except Exception:
+                gname = gid
+            scopes.append(("guild", gid, f"{gname}", args.channel_filter))
+    else:
+        # Search everywhere — enumerate guilds + DMs
+        all_guilds: list[dict] = []
+        all_dms: list[dict] = []
+        try:
+            all_guilds = list_my_guilds(s)
+        except Exception as e:
+            print(f"[warn] could not list guilds: {e}", file=sys.stderr)
+        try:
+            all_dms = list_my_dms(s)
+        except Exception as e:
+            print(f"[warn] could not list DMs: {e}", file=sys.stderr)
+        for g in all_guilds:
+            scopes.append(("guild", g["id"], g.get("name", g["id"]), None))
+        for c in all_dms:
+            recips = ",".join(r.get("username", "?") for r in c.get("recipients", []))
+            scopes.append(("channel", c["id"], f"DM:{recips}", None))
+
+    if not scopes:
+        print("no scopes to search — are you in any servers or DMs?")
+        return 1
+
+    # Prefetch guild channels for name resolution
+    guild_channels: dict[str, dict[str, str]] = {}  # guild_id -> {channel_id: name}
+    for scope_type, scope_id, label, _ in scopes:
+        if scope_type == "guild" and scope_id not in guild_channels:
+            try:
+                r = _request(s, "GET", f"{API}/guilds/{scope_id}/channels", timeout=15)
+                r.raise_for_status()
+                guild_channels[scope_id] = {
+                    c["id"]: f"#{c.get('name', c['id'])}" for c in r.json()
+                }
+            except Exception:
+                guild_channels[scope_id] = {}
+
+    # Compute snowflake bounds from date args.
+    # max_id=0 means "Discord epoch" (2015-01-01) which returns nothing —
+    # default to "now" so the search isn't silently empty when --before is omitted.
+    max_id = snowflake_at(args.before) if args.before else snowflake_at(datetime.now(timezone.utc))
+    min_id = snowflake_at(args.after) if args.after else 0
+
+    # Header
+    parts = []
+    if args.content:
+        parts.append(f'content="{args.content}"')
+    else:
+        parts.append("recent messages")
+    if guilds:
+        parts.append(f"{len(guilds)} server(s)")
+    elif channels:
+        parts.append(f"{len(channels)} channel(s)")
+    else:
+        parts.append(f"{len(scopes)} scopes")
+    print(f"Search: {'; '.join(parts)}")
+    print(f"  authenticated as @{me.get('username')}")
+    if args.before:
+        print(f"  before: {args.before.isoformat()}")
+    if args.after:
+        print(f"  after:  {args.after.isoformat()}")
+    print()
+
+    grand_total = 0
+    for scope_type, scope_id, label, channel_filter in scopes:
+        if STOP:
+            break
+
+        total, hits, retry = search_messages(
+            s,
+            scope=scope_type,
+            scope_id=scope_id,
+            author_id=me["id"],
+            max_id=max_id,
+            min_id=min_id,
+            content=args.content,
+            channel_id=channel_filter,
+            offset=0,
+        )
+
+        status_icon = ""
+        if total is None:
+            if retry:
+                print(f"[{label}] ⏳ rate-limited (retry in {retry:.0f}s)\n")
+            else:
+                print(f"[{label}] ⏳ search index not ready\n")
+            continue
+        if total == -1:
+            print(f"[{label}] 🔒 no permission\n")
+            continue
+        if not hits:
+            print(f"[{label}] (no matches)\n")
+            continue
+
+        if total is not None and total > 0:
+            status_icon = f" ({len(hits)} shown of {total} total)"
+
+        print(f"[{label}]{status_icon}")
+
+        channels_map = guild_channels.get(scope_id, {}) if scope_type == "guild" else {}
+        for m in hits:
+            mid = str(m["id"])
+            cid = str(m["channel_id"])
+            ch_name = channels_map.get(cid, cid)
+
+            # Extract content. Discord search returns content as a string
+            # on the hit object, but handle edge cases defensively.
+            raw_content = m.get("content", "")
+            if isinstance(raw_content, list):
+                raw_content = " ".join(
+                    part.get("content", "") if isinstance(part, dict) else str(part)
+                    for part in raw_content
+                )
+            content = str(raw_content).replace("\n", "\\n")
+            if len(content) > 140:
+                content = content[:137] + "..."
+            if not content:
+                content = "[attachment / embed]"
+
+            ts = snowflake_to_dt(int(mid))
+            ts_str = ts.strftime("%Y-%m-%d %H:%M UTC")
+
+            print(f"  [{ch_name}] {ts_str}")
+            print(f"    {content}")
+
+        grand_total += len(hits)
+        print()
+
+    print(f"--- {grand_total} matches shown ---")
+    if guilds:
+        ids = " ".join(f"--guild {g}" for g in guilds)
+        print(f"\nTo delete all:  discord-wipe purge {ids}")
+    elif channels:
+        ids = " ".join(f"--channel {c}" for c in channels)
+        print(f"\nTo delete all:  discord-wipe purge {ids}")
+    else:
+        print("\nTo delete from a server:  discord-wipe purge --guild <ID>")
+        print("To delete from a channel: discord-wipe purge --channel <ID>")
+
+    return 0
+
+
+def _parse_date_arg(s: str) -> datetime:
+    """Parse a date string like '2024-06-01' into a UTC datetime.
+
+    Accepts ISO date (YYYY-MM-DD) or ISO datetime with optional timezone.
+    Returns a timezone-aware UTC datetime.
+    """
+    s = s.strip()
+    # Try full ISO datetime first
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        pass
+    # Try date-only
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d")
+        return dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid date '{s}': expected YYYY-MM-DD or ISO datetime"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         prog="discord-wipe",
@@ -1881,6 +2126,50 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--dry-run", action="store_true", help="report without deleting")
     p.set_defaults(func=cmd_purge)
+
+    p = sub.add_parser(
+        "search",
+        help="search your messages across servers/DMs and preview results",
+        description=(
+            "Search your messages with an optional content filter and preview "
+            "channel + timestamp + content before deciding to delete. "
+            "Use this as the discovery step before `purge`."
+        ),
+    )
+    p.add_argument(
+        "--guild",
+        action="append",
+        metavar="GUILD_ID",
+        help="server to search within (repeatable; omit to search everywhere)",
+    )
+    p.add_argument(
+        "--channel",
+        action="append",
+        metavar="CHANNEL_ID",
+        help="channel or DM to search within (repeatable)",
+    )
+    p.add_argument(
+        "--channel-filter",
+        metavar="CHANNEL_ID",
+        help="when searching a guild, limit to this channel (only with --guild)",
+    )
+    p.add_argument(
+        "--content",
+        help="text to search for (omit to see recent messages)",
+    )
+    p.add_argument(
+        "--before",
+        type=_parse_date_arg,
+        metavar="DATE",
+        help="only show messages before this date (YYYY-MM-DD or ISO datetime)",
+    )
+    p.add_argument(
+        "--after",
+        type=_parse_date_arg,
+        metavar="DATE",
+        help="only show messages after this date (YYYY-MM-DD or ISO datetime)",
+    )
+    p.set_defaults(func=cmd_search)
 
     return ap.parse_args()
 
