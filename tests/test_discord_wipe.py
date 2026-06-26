@@ -1351,9 +1351,7 @@ class PurgeSubcommand(unittest.TestCase):
             with (
                 mock.patch.object(dw, "list_my_guilds") as mock_guilds,
                 mock.patch.object(dw, "list_my_dms") as mock_dms,
-                mock.patch.object(
-                    dw, "search_messages", return_value=(0, [], None)
-                ),
+                mock.patch.object(dw, "search_messages", return_value=(0, [], None)),
             ):
                 dw.phase_live_catchup(sess, cfg, targets_override=targets_in)
 
@@ -1394,6 +1392,141 @@ class PurgeSubcommand(unittest.TestCase):
                 scopes,
                 [("guild", "G1"), ("guild", "G2"), ("channel", "C1")],
             )
+
+
+class SearchSubcommand(unittest.TestCase):
+    """Tests for the `search` subcommand (cmd_search + _parse_date_arg +
+    the optional search_messages params).
+
+    Added alongside the v0.6.0 `search` discovery command. `search` is
+    READ-ONLY — it must never issue a DELETE — and like every other live
+    path it must server-side-filter by author_id=self.
+    """
+
+    def test_parse_date_arg_iso_date(self):
+        dt = dw._parse_date_arg("2024-06-01")
+        self.assertEqual((dt.year, dt.month, dt.day), (2024, 6, 1))
+        self.assertEqual(dt.tzinfo, timezone.utc)
+
+    def test_parse_date_arg_iso_datetime_naive_gets_utc(self):
+        dt = dw._parse_date_arg("2024-06-01T12:30:00")
+        self.assertEqual((dt.hour, dt.minute), (12, 30))
+        self.assertEqual(dt.tzinfo, timezone.utc)
+
+    def test_parse_date_arg_iso_datetime_with_offset_preserved(self):
+        dt = dw._parse_date_arg("2024-06-01T12:00:00+00:00")
+        self.assertIsNotNone(dt.tzinfo)
+        self.assertEqual(dt.utcoffset().total_seconds(), 0)
+
+    def test_parse_date_arg_invalid_raises(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            dw._parse_date_arg("not-a-date")
+
+    def test_search_messages_omits_max_id_when_zero(self):
+        """Default max_id=0 must NOT be sent as a query param (0 = Discord
+        epoch = empty result); only an explicit non-zero bound is sent."""
+        sess = mock.MagicMock()
+        resp = mock.MagicMock(status_code=200)
+        resp.json.return_value = {"total_results": 0, "messages": []}
+        with mock.patch.object(dw, "_request", return_value=resp) as req:
+            dw.search_messages(sess, scope="guild", scope_id="G", author_id="self-id")
+        params = req.call_args.kwargs["params"]
+        self.assertEqual(params["author_id"], "self-id")
+        self.assertNotIn("max_id", params)
+        self.assertNotIn("min_id", params)
+        self.assertNotIn("content", params)
+
+    def test_search_messages_passes_optional_filters(self):
+        """content / min_id / max_id / channel_id are forwarded when set."""
+        sess = mock.MagicMock()
+        resp = mock.MagicMock(status_code=200)
+        resp.json.return_value = {"total_results": 0, "messages": []}
+        with mock.patch.object(dw, "_request", return_value=resp) as req:
+            dw.search_messages(
+                sess,
+                scope="guild",
+                scope_id="G",
+                author_id="self-id",
+                max_id=999,
+                min_id=111,
+                content="hello",
+                channel_id="C9",
+            )
+        params = req.call_args.kwargs["params"]
+        self.assertEqual(params["max_id"], "999")
+        self.assertEqual(params["min_id"], "111")
+        self.assertEqual(params["content"], "hello")
+        self.assertEqual(params["channel_id"], "C9")
+
+    def test_search_messages_channel_id_ignored_for_channel_scope(self):
+        """channel_id only applies to a guild search; it must be dropped on
+        a channel scope (the endpoint is already channel-specific)."""
+        sess = mock.MagicMock()
+        resp = mock.MagicMock(status_code=200)
+        resp.json.return_value = {"total_results": 0, "messages": []}
+        with mock.patch.object(dw, "_request", return_value=resp) as req:
+            dw.search_messages(
+                sess,
+                scope="channel",
+                scope_id="C",
+                author_id="self-id",
+                channel_id="C9",
+            )
+        self.assertNotIn("channel_id", req.call_args.kwargs["params"])
+
+    def test_search_always_passes_author_id_self(self):
+        """cmd_search must server-side-filter by author_id=self on every
+        search_messages call (same safety mandate as catchup)."""
+        _reset_stop()
+        args = argparse.Namespace(
+            cmd="search",
+            token="fake-token",
+            guild=["G1"],
+            channel=[],
+            channel_filter=None,
+            content="keyword",
+            before=None,
+            after=None,
+        )
+        gresp = mock.MagicMock(status_code=200)
+        gresp.json.return_value = {"name": "Guild One"}
+        gresp.raise_for_status.return_value = None
+        with (
+            mock.patch.object(dw, "get_me", return_value={"id": "self-id", "username": "test"}),
+            mock.patch.object(dw, "_request", return_value=gresp),
+            mock.patch.object(dw, "search_messages", return_value=(0, [], None)) as sm,
+        ):
+            rc = dw.cmd_search(args)
+
+        self.assertEqual(rc, 0)
+        self.assertGreater(sm.call_count, 0)
+        for call in sm.call_args_list:
+            self.assertEqual(call.kwargs.get("author_id"), "self-id")
+
+    def test_search_never_deletes(self):
+        """cmd_search must not call delete_message under any path."""
+        _reset_stop()
+        args = argparse.Namespace(
+            cmd="search",
+            token="fake-token",
+            guild=[],
+            channel=["C1"],
+            channel_filter=None,
+            content=None,
+            before=None,
+            after=None,
+        )
+        hit = {"id": "123456789012345678", "channel_id": "C1", "content": "hi"}
+        with (
+            mock.patch.object(dw, "get_me", return_value={"id": "self-id", "username": "test"}),
+            mock.patch.object(dw, "list_my_dms", return_value=[]),
+            mock.patch.object(dw, "search_messages", return_value=(1, [hit], None)),
+            mock.patch.object(dw, "delete_message") as del_mock,
+        ):
+            rc = dw.cmd_search(args)
+
+        self.assertEqual(rc, 0)
+        del_mock.assert_not_called()
 
 
 if __name__ == "__main__":

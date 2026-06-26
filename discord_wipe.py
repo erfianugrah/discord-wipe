@@ -63,7 +63,7 @@ import requests
 # Constants
 # ---------------------------------------------------------------------------
 
-__version__ = "0.6.0"  # bump on every behaviour change; tag releases as vX.Y.Z
+__version__ = "0.6.1"  # bump on every behaviour change; tag releases as vX.Y.Z
 
 API = "https://discord.com/api/v10"
 DISCORD_EPOCH_MS = 1420070400000  # 2015-01-01T00:00:00Z
@@ -1818,10 +1818,8 @@ def cmd_search(args) -> int:
         # Resolve DM recipient names for channel scopes
         dms: dict[str, dict] = {}
         if channels:
-            try:
+            with contextlib.suppress(Exception):
                 dms = {c["id"]: c for c in list_my_dms(s)}
-            except Exception:
-                pass
         for cid in channels:
             dm = dms.get(cid)
             if dm:
@@ -1862,14 +1860,12 @@ def cmd_search(args) -> int:
 
     # Prefetch guild channels for name resolution
     guild_channels: dict[str, dict[str, str]] = {}  # guild_id -> {channel_id: name}
-    for scope_type, scope_id, label, _ in scopes:
+    for scope_type, scope_id, _label, _ in scopes:
         if scope_type == "guild" and scope_id not in guild_channels:
             try:
                 r = _request(s, "GET", f"{API}/guilds/{scope_id}/channels", timeout=15)
                 r.raise_for_status()
-                guild_channels[scope_id] = {
-                    c["id"]: f"#{c.get('name', c['id'])}" for c in r.json()
-                }
+                guild_channels[scope_id] = {c["id"]: f"#{c.get('name', c['id'])}" for c in r.json()}
             except Exception:
                 guild_channels[scope_id] = {}
 
@@ -2000,7 +1996,7 @@ def _parse_date_arg(s: str) -> datetime:
     except ValueError:
         raise argparse.ArgumentTypeError(
             f"invalid date '{s}': expected YYYY-MM-DD or ISO datetime"
-        )
+        ) from None
 
 
 def parse_args() -> argparse.Namespace:
