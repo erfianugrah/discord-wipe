@@ -1,5 +1,16 @@
 # AGENTS.md — discord-wipe
 
+> **DEPRECATED — superseded by `~/discord-wipe-go`.** As of 2026-06-26 the
+> deployed daemon is the Go rewrite (`ghcr.io/erfianugrah/discord-wipe-go`,
+> repo `github.com/erfianugrah/discord-wipe-go`). This Python repo is no
+> longer deployed; the composer `discord-wipe` stack on `servarr` pulls the
+> Go image. Make behaviour changes, fixes, and tests in `discord-wipe-go`,
+> NOT here. The operational notes below (composer git-sync, the `.env`
+> footgun, state-recovery, the safety mandate) still describe the live stack
+> and remain accurate — the Go port preserves the same state schema, mounts,
+> env vars, and only-my-messages guarantees. Everything Python-specific
+> (the single `discord_wipe.py`, its tests, ruff config) is historical.
+
 Context for AI agents working in this repo. Read this top-to-bottom before
 making any change — most of it is non-obvious from the code alone.
 

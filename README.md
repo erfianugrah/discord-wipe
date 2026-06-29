@@ -1,5 +1,17 @@
 # discord-wipe
 
+> [!WARNING]
+> **DEPRECATED — superseded by the Go rewrite.** This Python implementation
+> is no longer the deployed daemon. Production (`servarr`, composer stack
+> `discord-wipe`) now runs **`ghcr.io/erfianugrah/discord-wipe-go`** built
+> from <https://github.com/erfianugrah/discord-wipe-go> (repo
+> `~/discord-wipe-go`). The Go version is the source of truth for behaviour,
+> deployment, and bug fixes.
+>
+> This repo is kept for historical reference and the design notes in `docs/`.
+> Do not deploy it. New work — features, fixes, the test suite — belongs in
+> `discord-wipe-go`.
+
 Rolling-retention deleter for your own Discord messages. Runs as a
 long-lived container; every pass it deletes everything you posted older
 than `RETENTION_DAYS` (default 14). Sleeps `INTERVAL_HOURS`, repeats.
